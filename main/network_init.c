@@ -51,6 +51,55 @@ static void got_eth_ip_event_handler(void *arg, esp_event_base_t event_base, int
     ESP_LOGI(TAG, "Ethernet IPv4: " IPSTR, IP2STR(&event->ip_info.ip));
 }
 
+#if CONFIG_USBIP_ETH_PHY_YT8531_INIT
+/* Read-modify-write a YT8531 extended register via EXT addr (0x1E) / data (0x1F). */
+static esp_err_t yt8531_ext_reg_update(esp_eth_handle_t eth_handle, uint32_t ext_reg,
+                                       uint32_t clear_mask, uint32_t set_bits)
+{
+    uint32_t reg_val = ext_reg;
+    esp_eth_phy_reg_rw_data_t phy_reg = {.reg_addr = 0x1E, .reg_value_p = &reg_val};
+    esp_err_t err = esp_eth_ioctl(eth_handle, ETH_CMD_WRITE_PHY_REG, &phy_reg);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    phy_reg.reg_addr = 0x1F;
+    err = esp_eth_ioctl(eth_handle, ETH_CMD_READ_PHY_REG, &phy_reg);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    reg_val = (reg_val & ~clear_mask) | set_bits;
+    return esp_eth_ioctl(eth_handle, ETH_CMD_WRITE_PHY_REG, &phy_reg);
+}
+
+static esp_err_t yt8531_rgmii_init(esp_eth_handle_t eth_handle)
+{
+    /* The YT8531 comes out of the generic driver's reset with auto-negotiation off. */
+    bool auto_nego_en = true;
+    esp_err_t err = esp_eth_ioctl(eth_handle, ETH_CMD_S_AUTONEGO, &auto_nego_en);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* Rx: ~2 ns coarse delay, EXT_CHIP_CONFIG (0xA001) bit 8 rxc_dly_en. */
+    err = yt8531_ext_reg_update(eth_handle, 0xA001, 0, 1U << 8);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* Tx: EXT_RGMII_CONFIG1 (0xA003) tx_delay_sel[3:0] and tx_delay_sel_fe[7:4]
+     * = 13 steps x 150 ps (~1.95 ns). */
+    err = yt8531_ext_reg_update(eth_handle, 0xA003, 0x00FF, (13U << 4) | 13U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    ESP_LOGI(TAG, "YT8531 RGMII delays configured (Rx ~2 ns, Tx ~1.95 ns)");
+    return ESP_OK;
+}
+#endif
+
 static esp_err_t network_init_ethernet(void)
 {
     esp_err_t err = esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL);
@@ -78,6 +127,45 @@ static esp_err_t network_init_ethernet(void)
     emac_config.smi_gpio.mdc_num = CONFIG_USBIP_ETH_MDC_GPIO;
     emac_config.smi_gpio.mdio_num = CONFIG_USBIP_ETH_MDIO_GPIO;
 
+#if CONFIG_USBIP_ETH_INTERFACE_RGMII
+    emac_config.interface = EMAC_DATA_INTERFACE_RGMII;
+    emac_config.clock_config.rgmii.clock_tx_gpio = CONFIG_USBIP_ETH_RGMII_TX_CLK_GPIO;
+    emac_config.clock_config.rgmii.clock_rx_gpio = CONFIG_USBIP_ETH_RGMII_RX_CLK_GPIO;
+    emac_config.clock_config.rgmii.clock_phy_ref_gpio = CONFIG_USBIP_ETH_RGMII_PHY_REF_CLK_GPIO;
+
+    emac_config.emac_dataif_gpio.rgmii.tx_ctl_num = CONFIG_USBIP_ETH_RGMII_TX_CTL_GPIO;
+    emac_config.emac_dataif_gpio.rgmii.txd0_num = CONFIG_USBIP_ETH_RGMII_TXD0_GPIO;
+    emac_config.emac_dataif_gpio.rgmii.txd1_num = CONFIG_USBIP_ETH_RGMII_TXD1_GPIO;
+    emac_config.emac_dataif_gpio.rgmii.txd2_num = CONFIG_USBIP_ETH_RGMII_TXD2_GPIO;
+    emac_config.emac_dataif_gpio.rgmii.txd3_num = CONFIG_USBIP_ETH_RGMII_TXD3_GPIO;
+    emac_config.emac_dataif_gpio.rgmii.rx_ctl_num = CONFIG_USBIP_ETH_RGMII_RX_CTL_GPIO;
+    emac_config.emac_dataif_gpio.rgmii.rxd0_num = CONFIG_USBIP_ETH_RGMII_RXD0_GPIO;
+    emac_config.emac_dataif_gpio.rgmii.rxd1_num = CONFIG_USBIP_ETH_RGMII_RXD1_GPIO;
+    emac_config.emac_dataif_gpio.rgmii.rxd2_num = CONFIG_USBIP_ETH_RGMII_RXD2_GPIO;
+    emac_config.emac_dataif_gpio.rgmii.rxd3_num = CONFIG_USBIP_ETH_RGMII_RXD3_GPIO;
+
+    ESP_LOGI(TAG,
+             "EMAC config: interface=RGMII TXC=%d RXC=%d REF_CLK=%d "
+             "MDC=%d MDIO=%d PHY_ADDR=%d RST=%d "
+             "TX_CTL=%d TXD0-3=%d,%d,%d,%d RX_CTL=%d RXD0-3=%d,%d,%d,%d",
+             emac_config.clock_config.rgmii.clock_tx_gpio,
+             emac_config.clock_config.rgmii.clock_rx_gpio,
+             emac_config.clock_config.rgmii.clock_phy_ref_gpio,
+             emac_config.smi_gpio.mdc_num,
+             emac_config.smi_gpio.mdio_num,
+             phy_config.phy_addr,
+             phy_config.reset_gpio_num,
+             emac_config.emac_dataif_gpio.rgmii.tx_ctl_num,
+             emac_config.emac_dataif_gpio.rgmii.txd0_num,
+             emac_config.emac_dataif_gpio.rgmii.txd1_num,
+             emac_config.emac_dataif_gpio.rgmii.txd2_num,
+             emac_config.emac_dataif_gpio.rgmii.txd3_num,
+             emac_config.emac_dataif_gpio.rgmii.rx_ctl_num,
+             emac_config.emac_dataif_gpio.rgmii.rxd0_num,
+             emac_config.emac_dataif_gpio.rgmii.rxd1_num,
+             emac_config.emac_dataif_gpio.rgmii.rxd2_num,
+             emac_config.emac_dataif_gpio.rgmii.rxd3_num);
+#else
     // Override RMII clock configuration
 #if CONFIG_USBIP_ETH_RMII_CLK_MODE == 0
     emac_config.clock_config.rmii.clock_mode = EMAC_CLK_EXT_IN;
@@ -111,6 +199,7 @@ static esp_err_t network_init_ethernet(void)
              emac_config.emac_dataif_gpio.rmii.crs_dv_num,
              emac_config.emac_dataif_gpio.rmii.rxd0_num,
              emac_config.emac_dataif_gpio.rmii.rxd1_num);
+#endif
 
     ESP_LOGI(TAG, "Creating EMAC MAC instance...");
 
@@ -133,6 +222,14 @@ static esp_err_t network_init_ethernet(void)
     if (err != ESP_OK) {
         return err;
     }
+
+#if CONFIG_USBIP_ETH_PHY_YT8531_INIT
+    err = yt8531_rgmii_init(eth_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "YT8531 PHY init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+#endif
 
     ESP_LOGI(TAG, "Attaching netif...");
     err = esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle));

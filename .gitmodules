@@ -1,8 +1,9 @@
 [submodule "esp-idf"]
 	path = esp-idf
-	url = https://github.com/adafruit/esp-idf.git
-	branch = usbip-bridge
+	url = https://github.com/espressif/esp-idf.git
+	branch = master
 
 [submodule "esp-harness"]
 	path = esp-harness
-	url = https://github.com/adafruit/esp-harness.git
+	url = https://github.com/tyeth-ai-assisted/esp-harness.git
+	branch = s31-function-coreboard-1

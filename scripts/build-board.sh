@@ -12,7 +12,7 @@ BOARD="${1:-}"
 ACTION="build"
 
 if [[ -z "${BOARD}" ]]; then
-    echo "Usage: $0 <p4-function-ev|m5stack-poe-p4|p4hil|s3-usb-otg> [build|flash|monitor|clean]" >&2
+    echo "Usage: $0 <p4-function-ev|m5stack-poe-p4|p4hil|s3-usb-otg|s31-function-coreboard-1> [build|flash|monitor|clean]" >&2
     exit 1
 fi
 
@@ -21,6 +21,7 @@ if [[ $# -ge 2 ]]; then
 fi
 
 PORT="${3:-}"
+IDF_GLOBAL_ARGS=()
 
 case "${BOARD}" in
     p4-function-ev)
@@ -47,6 +48,14 @@ case "${BOARD}" in
         SDKCONFIG_FILE="sdkconfig.p4hil"
         DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.p4hil"
         ;;
+    s31-function-coreboard-1)
+        TARGET="esp32s31"
+        BUILD_DIR="build-s31-function-coreboard-1"
+        SDKCONFIG_FILE="sdkconfig.s31-function-coreboard-1"
+        DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.s31-function-coreboard-1"
+        # esp32s31 is still a preview target in ESP-IDF.
+        IDF_GLOBAL_ARGS=(--preview)
+        ;;
     *)
         echo "Unknown board: ${BOARD}" >&2
         exit 1
@@ -67,7 +76,8 @@ if [[ -n "${PORT}" ]]; then
     PORT_ARGS=(-p "${PORT}")
 fi
 
-idf.py -B "${BUILD_DIR}" \
+idf.py "${IDF_GLOBAL_ARGS[@]+"${IDF_GLOBAL_ARGS[@]}"}" \
+    -B "${BUILD_DIR}" \
     "${PORT_ARGS[@]+"${PORT_ARGS[@]}"}" \
     -DIDF_TARGET="${TARGET}" \
     -DSDKCONFIG="${SDKCONFIG_FILE}" \

@@ -1,6 +1,6 @@
 # ESP32-P4 USB/IP Bridge (ESP-IDF)
 
-This project is an ESP-IDF scaffold for ESP32-P4 / ESP32-S3 USB dev boards that:
+This project is an ESP-IDF scaffold for ESP32-P4 / ESP32-S3 / ESP32-S31 USB dev boards that:
 
 - runs USB Host mode,
 - enumerates and exports multiple non-hub USB devices (including devices behind a USB hub),
@@ -38,8 +38,8 @@ USB/IP wire format is implemented from Linux kernel documentation:
 
 ## Cloning
 
-The `esp-harness` submodule declares its own `esp-idf`, pinned to the same commit
-as the top-level one, and the build never reads it. Initialise selectively rather
+The `esp-harness` submodule declares its own `esp-idf`, which the build never
+reads. Initialise selectively rather
 than with `--recursive` to avoid downloading a second full ESP-IDF:
 
 ```bash
@@ -51,7 +51,7 @@ git -C esp-harness submodule update --init components/scpi_parser/upstream
 
 ## ESP-IDF Setup
 
-This repository pins ESP-IDF to a commit on the `adafruit/esp-idf` fork, two commits past `v6.0`. The fork carries the `usb_dwc` FS-only patch that `USB_DWC_FSLS_ONLY` depends on, so the pin cannot be replaced with an upstream release tag.
+This repository pins ESP-IDF to a commit on upstream `espressif/esp-idf` `master`, because no release tag supports the ESP32-S31 yet (it is still a preview target, so `scripts/build-board.sh` passes `--preview` for it). FS-only USB host mode (`USB_DWC_FSLS_ONLY`) is provided by the `adafruit/esp-usb` fork referenced from `main/idf_component.yml`, so ESP-IDF itself needs no patches.
 
 1. Clone/install ESP-IDF locally for this project:
 
@@ -67,13 +67,15 @@ source ./scripts/idf-env.sh
 
 ## Build and Flash
 
-Four board profiles are provided:
+Five board profiles are provided:
 
 - `p4-function-ev`: ESP32-P4-Function-EV board, USB/IP over Ethernet
 - `m5stack-poe-p4`: M5Stack PoE ESP32-P4, USB/IP over Ethernet
 - `p4hil`: [P4HIL](https://github.com/tannewt/p4hil) hardware-in-the-loop
   fixture, USB/IP over Ethernet
 - `s3-usb-otg`: ESP32-S3-USB-OTG board, USB/IP over Wi-Fi STA
+- `s31-function-coreboard-1`: ESP32-S31-Function-CoreBoard-1, USB/IP over
+  gigabit (RGMII) Ethernet, USB host on the USB-HS port
 
 Set your serial port once (example):
 
@@ -84,6 +86,7 @@ export ESPPORT=/dev/ttyUSB0
 Console output defaults by target:
 - ESP32-P4 boards: USB Serial/JTAG console
 - `s3-usb-otg`: `UART0` console (to avoid USB host conflicts)
+- `s31-function-coreboard-1`: USB Serial/JTAG console
 
 Once running, a board announces itself over mDNS, so you do not need to know its
 address in advance:
@@ -105,6 +108,26 @@ Flash and monitor:
 ```bash
 ESPPORT=$ESPPORT ./scripts/build-board.sh p4-function-ev flash
 ESPPORT=$ESPPORT ./scripts/build-board.sh p4-function-ev monitor
+```
+
+### ESP32-S31-Function-CoreBoard-1
+
+The ESP32-S31 has a single USB OTG controller with a high-speed (UTMI) PHY and
+no separate full-speed PHY. Like the P4 boards it is run in FS-only mode, so a
+hub on the USB-HS port negotiates at full speed and FS/LS devices behind it work
+without split transactions.
+
+Build:
+
+```bash
+./scripts/build-board.sh s31-function-coreboard-1 build
+```
+
+Flash and monitor:
+
+```bash
+ESPPORT=$ESPPORT ./scripts/build-board.sh s31-function-coreboard-1 flash
+ESPPORT=$ESPPORT ./scripts/build-board.sh s31-function-coreboard-1 monitor
 ```
 
 ### ESP32-S3-USB-OTG

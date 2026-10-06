@@ -4,6 +4,7 @@ choice USBIP_BOARD
     prompt "Target board"
     default USBIP_BOARD_ESPRESSIF_ESP32P4_FUNCTION_EV if IDF_TARGET_ESP32P4
     default USBIP_BOARD_ESPRESSIF_ESP32S3_USB_OTG if IDF_TARGET_ESP32S3
+    default USBIP_BOARD_ESPRESSIF_ESP32S31_FUNCTION_COREBOARD_1 if IDF_TARGET_ESP32S31
     help
         Select the target hardware board.  This selects pin mappings,
         transport defaults, and board-specific GPIO configurations.
@@ -34,17 +35,21 @@ choice USBIP_BOARD
     config USBIP_BOARD_ESPRESSIF_ESP32S3_USB_OTG
         bool "espressif_esp32s3_usb_otg"
         depends on IDF_TARGET_ESP32S3
+
+    config USBIP_BOARD_ESPRESSIF_ESP32S31_FUNCTION_COREBOARD_1
+        bool "espressif_esp32s31_function_coreboard_1"
+        depends on IDF_TARGET_ESP32S31
 endchoice
 
 choice USBIP_TRANSPORT
     prompt "Network transport"
-    default USBIP_TRANSPORT_ETHERNET if IDF_TARGET_ESP32P4
+    default USBIP_TRANSPORT_ETHERNET if IDF_TARGET_ESP32P4 || IDF_TARGET_ESP32S31
     default USBIP_TRANSPORT_WIFI if IDF_TARGET_ESP32S3
     default USBIP_TRANSPORT_ETHERNET
 
     config USBIP_TRANSPORT_ETHERNET
         bool "Ethernet"
-        depends on IDF_TARGET_ESP32P4
+        depends on IDF_TARGET_ESP32P4 || IDF_TARGET_ESP32S31
     config USBIP_TRANSPORT_WIFI
         bool "Wi-Fi STA"
         depends on IDF_TARGET_ESP32S3
@@ -52,22 +57,43 @@ endchoice
 
 if USBIP_TRANSPORT_ETHERNET
 
+choice USBIP_ETH_INTERFACE
+    prompt "Ethernet MAC-PHY interface"
+    default USBIP_ETH_INTERFACE_RGMII if IDF_TARGET_ESP32S31
+    default USBIP_ETH_INTERFACE_RMII
+    help
+        RMII is the 10/100 interface used by the ESP32-P4 boards.  RGMII is
+        the 10/100/1000 interface used by the ESP32-S31, whose EMAC is
+        gigabit-capable.
+
+    config USBIP_ETH_INTERFACE_RMII
+        bool "RMII (10/100)"
+    config USBIP_ETH_INTERFACE_RGMII
+        bool "RGMII (10/100/1000)"
+        depends on IDF_TARGET_ESP32S31
+endchoice
+
 config USBIP_ETH_MDC_GPIO
     int "Ethernet MDC GPIO"
+    default 5 if IDF_TARGET_ESP32S31
     default 31
 
 config USBIP_ETH_MDIO_GPIO
     int "Ethernet MDIO GPIO"
+    default 6 if IDF_TARGET_ESP32S31
     default 52
 
 config USBIP_ETH_PHY_ADDR
-    int "Ethernet PHY address"
-    range 0 31
+    int "Ethernet PHY address (-1 to auto-detect)"
+    range -1 31
     default 1
 
 config USBIP_ETH_PHY_RST_GPIO
     int "Ethernet PHY reset GPIO (-1 to disable)"
+    default 7 if IDF_TARGET_ESP32S31
     default 51
+
+if USBIP_ETH_INTERFACE_RMII
 
 config USBIP_ETH_RMII_CLK_MODE
     int "RMII clock mode (0=EXT_IN, 1=EXT_OUT)"
@@ -105,6 +131,75 @@ config USBIP_ETH_RMII_RXD0_GPIO
 config USBIP_ETH_RMII_RXD1_GPIO
     int "RMII RXD1 GPIO"
     default 30
+
+endif # USBIP_ETH_INTERFACE_RMII
+
+if USBIP_ETH_INTERFACE_RGMII
+
+# Defaults match ETH_ESP32_EMAC_DEFAULT_CONFIG() for the ESP32-S31.
+
+config USBIP_ETH_RGMII_TX_CLK_GPIO
+    int "RGMII TX_CLK (TXC) GPIO"
+    default 13
+
+config USBIP_ETH_RGMII_RX_CLK_GPIO
+    int "RGMII RX_CLK (RXC) GPIO"
+    default 14
+
+config USBIP_ETH_RGMII_PHY_REF_CLK_GPIO
+    int "PHY reference clock output GPIO (-1 if the PHY has its own crystal)"
+    default -1
+
+config USBIP_ETH_RGMII_TX_CTL_GPIO
+    int "RGMII TX_CTL GPIO"
+    default 12
+
+config USBIP_ETH_RGMII_TXD0_GPIO
+    int "RGMII TXD0 GPIO"
+    default 8
+
+config USBIP_ETH_RGMII_TXD1_GPIO
+    int "RGMII TXD1 GPIO"
+    default 9
+
+config USBIP_ETH_RGMII_TXD2_GPIO
+    int "RGMII TXD2 GPIO"
+    default 10
+
+config USBIP_ETH_RGMII_TXD3_GPIO
+    int "RGMII TXD3 GPIO"
+    default 11
+
+config USBIP_ETH_RGMII_RX_CTL_GPIO
+    int "RGMII RX_CTL GPIO"
+    default 15
+
+config USBIP_ETH_RGMII_RXD0_GPIO
+    int "RGMII RXD0 GPIO"
+    default 19
+
+config USBIP_ETH_RGMII_RXD1_GPIO
+    int "RGMII RXD1 GPIO"
+    default 18
+
+config USBIP_ETH_RGMII_RXD2_GPIO
+    int "RGMII RXD2 GPIO"
+    default 17
+
+config USBIP_ETH_RGMII_RXD3_GPIO
+    int "RGMII RXD3 GPIO"
+    default 16
+
+config USBIP_ETH_PHY_YT8531_INIT
+    bool "Apply Motorcomm YT8531 RGMII PHY init"
+    default y if USBIP_BOARD_ESPRESSIF_ESP32S31_FUNCTION_COREBOARD_1
+    help
+        The generic 802.3 PHY driver leaves a YT8531 with auto-negotiation
+        disabled after reset and without RGMII clock delays.  This re-enables
+        auto-negotiation and sets ~2 ns Rx/Tx delays through the PHY's
+        extended registers, as ESP-IDF's examples/ethernet/basic does.
+
+endif # USBIP_ETH_INTERFACE_RGMII
 
 endif
 
@@ -221,11 +316,12 @@ config USBIP_MAX_DEVICES
 
 config USBIP_NUM_PIPES
     int "Number of USB host pipe request slots"
-    default 16 if IDF_TARGET_ESP32P4
+    default 16 if IDF_TARGET_ESP32P4 || IDF_TARGET_ESP32S31
     default 8
     help
         Number of concurrent USB transfer request slots.  Should match the
-        DWC host controller channel count (16 for ESP32-P4, 8 for ESP32-S3).
+        DWC host controller channel count (16 for ESP32-P4 and ESP32-S31,
+        8 for ESP32-S3).
 
 config USBIP_NEOPIXEL_GPIO
     int "Neopixel data GPIO"

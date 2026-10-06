@@ -46,11 +46,13 @@ static void device_name_key(const char *busid, char *key_buf, size_t key_size)
     key_buf[5 + busid_len * 2] = '\0';
 }
 
-/* Build the default MAC-based hostname. */
+/* Build the default MAC-based hostname.  ESP_MAC_BASE is always 6 bytes;
+ * esp_efuse_mac_get_default() returns an 8-byte EUI-64 on 802.15.4 chips
+ * such as the ESP32-S31. */
 static void default_hostname(char *buf, size_t buf_size)
 {
     uint8_t mac[6] = {0};
-    esp_err_t err = esp_efuse_mac_get_default(mac);
+    esp_err_t err = esp_read_mac(mac, ESP_MAC_BASE);
     if (err != ESP_OK) {
         /* Fallback: "usbip-000000" */
         strlcpy(buf, "usbip-000000", buf_size);

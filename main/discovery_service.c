@@ -137,7 +137,7 @@ static void discovery_task(void *arg)
 esp_err_t discovery_service_start(void)
 {
     uint8_t mac[6] = {0};
-    esp_err_t err = esp_efuse_mac_get_default(mac);
+    esp_err_t err = esp_read_mac(mac, ESP_MAC_BASE);
     if (err != ESP_OK) {
         return err;
     }

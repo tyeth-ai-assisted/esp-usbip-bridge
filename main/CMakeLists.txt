@@ -35,7 +35,7 @@ if(CONFIG_USBIP_VIRTUAL_HARNESS)
     )
 endif()
 
-if(IDF_TARGET STREQUAL "esp32p4")
+if(IDF_TARGET STREQUAL "esp32p4" OR IDF_TARGET STREQUAL "esp32s31")
     list(APPEND req_components esp_eth)
 elseif(IDF_TARGET STREQUAL "esp32s3")
     list(APPEND req_components esp_wifi esp_driver_gpio)

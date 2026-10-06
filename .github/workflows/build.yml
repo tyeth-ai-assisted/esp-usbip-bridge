@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        board: [p4-function-ev, m5stack-poe-p4, s3-usb-otg]
+        board: [p4-function-ev, m5stack-poe-p4, s3-usb-otg, s31-function-coreboard-1]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,7 +34,7 @@ jobs:
 
       - name: Install ESP-IDF tools
         run: |
-          ./esp-idf/install.sh esp32p4 esp32s3
+          ./esp-idf/install.sh esp32p4 esp32s3 esp32s31
 
       - name: Build ${{ matrix.board }}
         run: |
