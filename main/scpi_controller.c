@@ -113,7 +113,7 @@ static scpi_result_t hub_port_power(scpi_t *ctx)
     char extra[16] = "";
     param_text(ctx, extra, sizeof(extra), false);
     bool force = strcasecmp(extra, "FORCE") == 0;
-    esp_err_t err = hub_ctl_port_power(path, on, force, NULL, 0);
+    esp_err_t err = hub_ctl_port_power(path, on, force, NULL, NULL, 0);
     return err == ESP_OK ? SCPI_RES_OK : push_err(ctx, err);
 }
 

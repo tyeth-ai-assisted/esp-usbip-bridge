@@ -439,6 +439,26 @@ function showSettings(s) {
   var e = document.getElementById('setEnf'), r = document.getElementById('setRst');
   if (e && document.activeElement !== e) e.checked = !!s.enforce_per_port_switching;
   if (r && document.activeElement !== r) r.checked = !!s.restore_port_power;
+  var t = document.getElementById('setTo');
+  if (t && document.activeElement !== t) t.value = s.enum_timeout_ms;
+}
+
+/* path null = global default; empty value removes a hub/port override */
+function saveTimeout(path, value) {
+  var body = { timeout_ms: value === '' ? null : parseInt(value, 10) };
+  if (path) body.path = path;
+  api('POST', '/api/settings/enum_timeout', body, function (ok, r) {
+    if (!ok) alert('Enumeration timeout: ' + (r && r.error));
+    else showSettings(r);
+    setTimeout(refreshUsb, 200);
+  });
+}
+
+function timeoutInput(path, ms, override) {
+  return '<input class="txt" type="number" min="0" max="60000" style="width:70px"' +
+         ' title="Enumeration timeout (ms); empty = inherit"' +
+         (override ? ' value="' + esc(ms) + '"' : ' placeholder="' + esc(ms) + '"') +
+         ' onchange="saveTimeout(\'' + esc(path) + '\', this.value)">';
 }
 
 function saveSettings() {
@@ -477,8 +497,10 @@ function loadHubs() {
     var h = '';
     r.hubs.forEach(function (hub) {
       h += '<div class="hub"><strong>' + esc(hub.path) + '</strong> ' + esc(hub.vid) + ':' + esc(hub.pid) +
-           ' ' + esc(hub.product) + ' &mdash; ' + esc(hub.num_ports) + ' ports<br>' + hubChars(hub.characteristics) + '</div>';
-      h += '<table><thead><tr><th>Port</th><th>Power</th><th>Saved</th><th>Link</th><th>Speed</th><th>Attached</th><th>Action</th></tr></thead><tbody>';
+           ' ' + esc(hub.product) + ' &mdash; ' + esc(hub.num_ports) + ' ports, enumeration timeout ' +
+           timeoutInput(hub.path, hub.enum_timeout_ms, hub.enum_timeout_override) + ' ms<br>' +
+           hubChars(hub.characteristics) + '</div>';
+      h += '<table><thead><tr><th>Port</th><th>Power</th><th>Saved</th><th>Link</th><th>Speed</th><th>Attached</th><th>Enum timeout</th><th>Action</th></tr></thead><tbody>';
       hub.ports.forEach(function (p) {
         var dev = p.device ? (esc(p.device.type) + ' ' + esc(p.device.vid) + ':' + esc(p.device.pid)) : '';
         h += '<tr><td>' + esc(p.path) + '</td>' +
@@ -487,10 +509,13 @@ function loadHubs() {
              '<td>' + esc(p.desired) + (p.mismatch ? ' <span class="warn">mismatch</span>' : '') + '</td>' +
              '<td>' + (p.connected ? 'connected' : '<span class="muted">-</span>') + '</td>' +
              '<td>' + esc(p.speed) + '</td><td>' + dev + '</td>' +
+             '<td>' + timeoutInput(p.path, p.enum_timeout_ms, p.enum_timeout_override) + '</td>' +
              '<td>' + powerButtons(p.path) + '</td></tr>';
       });
       h += '</tbody></table>';
     });
+    /* don't clobber an input being edited */
+    if (el.contains(document.activeElement)) return;
     el.innerHTML = h;
   });
 }

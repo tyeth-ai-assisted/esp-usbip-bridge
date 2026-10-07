@@ -991,7 +991,11 @@ static void stream_html_page(stream_t *s)
         " unless forced; ganged hubs switch all ports or none)</span><br>"
         "<label><input type=\"checkbox\" id=\"setRst\" onchange=\"saveSettings()\">"
         " Restore port power on hub reset</label> <span class=\"muted\">(ports switched off stay off when"
-        " their hub re-enumerates: hub reset, power loss, bridge reboot)</span></p>\n"
+        " their hub re-enumerates: hub reset, power loss, bridge reboot)</span><br>"
+        "Enumeration timeout <input id=\"setTo\" class=\"txt\" type=\"number\" min=\"0\" max=\"60000\""
+        " style=\"width:80px\" onchange=\"saveTimeout(null, this.value)\"> ms"
+        " <span class=\"muted\">(0 = none; a device that does not answer in time has its port disabled"
+        " so others can enumerate; hubs and ports can override it below)</span></p>\n"
         "<div id=\"hubs\" class=\"muted\">Loading&hellip;</div>"
         "<p class=\"sub\"><button onclick=\"allPorts('off')\">All ports off</button>"
         " <button onclick=\"allPorts('on')\">All ports on</button>"
@@ -1312,7 +1316,10 @@ static void handle_connection(int fd)
         }
         if (n == 0) break;
         total += (size_t)n;
-        if (total >= 4 && memcmp(buf + total - 4, "\r\n\r\n", 4) == 0) break;
+        /* Stop at the end of the headers.  Clients usually send the body in
+           the same segment, so the terminator need not be at the end of what
+           was read; waiting for more would block until SO_RCVTIMEO (2 s). */
+        if (memmem(buf, total, "\r\n\r\n", 4) != NULL) break;
     }
     if (total == 0) { free(buf); return; }
 
@@ -1323,14 +1330,14 @@ static void handle_connection(int fd)
        endpoint (which may carry the full pin→wire mapping) is not
        truncated. */
     size_t body_cap = 512;
-    if (req.content_length > 0 && (size_t)req.content_length > body_cap)
-        body_cap = (size_t)req.content_length;
+    if (req.content_length > 0 && (size_t)req.content_length + 1 > body_cap)
+        body_cap = (size_t)req.content_length + 1;   /* + NUL terminator */
     if (body_cap > 8192) body_cap = 8192;
     char *body_buf = malloc(body_cap);
     size_t body_read = 0;
     if (!body_buf) { free(buf); http_500(fd); return; }
     if (req.content_length > 0) {
-        const char *start = strstr(buf, "\r\n\r\n");
+        const char *start = memmem(buf, total, "\r\n\r\n", 4);   /* buf is not NUL-terminated */
         if (start) {
             start += 4;
             size_t already = buf + total - start;

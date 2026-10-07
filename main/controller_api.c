@@ -494,7 +494,10 @@ static cJSON *port_json(const hub_ctl_port_t *p)
     cJSON_AddBoolToObject(o, "over_current", p->over_current);
     cJSON_AddBoolToObject(o, "user_off", p->user_off);
     cJSON_AddStringToObject(o, "desired", p->desired_on ? "on" : "off");
+    add_str_or_null(o, "pending", p->pending);
     cJSON_AddBoolToObject(o, "mismatch", p->mismatch);
+    cJSON_AddNumberToObject(o, "enum_timeout_ms", p->enum_timeout_ms);
+    cJSON_AddBoolToObject(o, "enum_timeout_override", p->enum_timeout_override);
     add_str_or_null(o, "speed", p->speed);
     if (p->has_device || p->has_hub) {
         cJSON *d = cJSON_AddObjectToObject(o, "device");
@@ -528,6 +531,8 @@ static api_result_t core_hubs(void)
         add_str_or_null(o, "manufacturer", s->hub.manufacturer);
         add_str_or_null(o, "product", s->hub.product);
         cJSON_AddBoolToObject(o, "ready", s->info_ok);
+        cJSON_AddNumberToObject(o, "enum_timeout_ms", s->enum_timeout_ms);
+        cJSON_AddBoolToObject(o, "enum_timeout_override", s->enum_timeout_override);
         if (s->info_ok) {
             cJSON_AddNumberToObject(o, "num_ports", s->info.num_ports);
             cJSON_AddStringToObject(o, "power_switching", hub_ctl_power_switching_name(s->info.power_switching));
@@ -610,11 +615,16 @@ static api_result_t port_action_ok(const char *path, const char *action)
 static api_result_t core_port_power(const char *path, bool on, bool force)
 {
     char msg[200] = "";
-    esp_err_t err = hub_ctl_port_power(path, on, force, msg, sizeof(msg));
+    bool pending = false;
+    esp_err_t err = hub_ctl_port_power(path, on, force, &pending, msg, sizeof(msg));
     if (err != ESP_OK) {
         return fail(status_for_err(err), msg[0] ? msg : esp_err_to_name(err));
     }
-    return port_action_ok(path, on ? "on" : "off");
+    api_result_t r = port_action_ok(path, on ? "on" : "off");
+    /* 202: the port is busy (e.g. its device is enumerating); applied shortly */
+    cJSON_AddBoolToObject(r.json, "pending", pending);
+    r.status = pending ? 202 : 200;
+    return r;
 }
 
 static api_result_t core_port_cycle(const char *path, int off_ms, bool force)
@@ -653,7 +663,53 @@ static cJSON *settings_json(void)
     cJSON *j = cJSON_CreateObject();
     cJSON_AddBoolToObject(j, "enforce_per_port_switching", st.enforce_per_port);
     cJSON_AddBoolToObject(j, "restore_port_power", st.restore_on_reset);
+    cJSON_AddNumberToObject(j, "enum_timeout_ms", st.enum_timeout_ms);
+    cJSON *ov = cJSON_AddArrayToObject(j, "enum_timeout_overrides");
+    hub_ctl_timeout_override_t t[HUB_CTL_MAX_TIMEOUT_OVERRIDES];
+    size_t n = hub_ctl_get_enum_timeouts(t, HUB_CTL_MAX_TIMEOUT_OVERRIDES);
+    for (size_t i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "path", t[i].path);
+        cJSON_AddNumberToObject(o, "timeout_ms", t[i].timeout_ms);
+        cJSON_AddItemToArray(ov, o);
+    }
     return j;
+}
+
+/* {"path": "1-1.3", "timeout_ms": int|null}; null or a negative value removes
+   the override.  Without "path" the global default is set. */
+static api_result_t core_set_enum_timeout(const cJSON *args)
+{
+    const char *path = json_string(args, "path");
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(args, "timeout_ms");
+    int ms = -1;
+    if (!cJSON_IsNull(v) && !json_int(args, "timeout_ms", &ms)) {
+        return fail(400, "timeout_ms must be an integer (ms, 0 = no timeout) or null");
+    }
+    if (ms > 60000) {
+        return fail(400, "timeout_ms is limited to 60000");
+    }
+    if (path == NULL) {
+        if (ms < 0) {
+            return fail(400, "the global timeout cannot be removed; use 0 for no timeout");
+        }
+        hub_ctl_settings_t st;
+        hub_ctl_get_settings(&st);
+        st.enum_timeout_ms = (uint32_t)ms;
+        esp_err_t err = hub_ctl_set_settings(&st);
+        if (err != ESP_OK) {
+            return fail(500, esp_err_to_name(err));
+        }
+    } else {
+        esp_err_t err = hub_ctl_set_enum_timeout(path, ms);
+        if (err != ESP_OK) {
+            return fail(status_for_err(err), err == ESP_ERR_NO_MEM ? "too many overrides"
+                        : "bad path (a port or hub path such as 1-1.3)");
+        }
+    }
+    cJSON *j = settings_json();
+    cJSON_AddBoolToObject(j, "ok", true);
+    return result(200, j);
 }
 
 static api_result_t core_get_settings(void)
@@ -671,6 +727,13 @@ static api_result_t core_set_settings(const cJSON *args)
     hub_ctl_get_settings(&st);
     st.enforce_per_port = json_bool(args, "enforce_per_port_switching", st.enforce_per_port);
     st.restore_on_reset = json_bool(args, "restore_port_power", st.restore_on_reset);
+    int to;
+    if (json_int(args, "enum_timeout_ms", &to)) {
+        if (to < 0 || to > 60000) {
+            return fail(400, "enum_timeout_ms must be 0..60000 (0 = no timeout)");
+        }
+        st.enum_timeout_ms = (uint32_t)to;
+    }
     esp_err_t err = hub_ctl_set_settings(&st);
     if (err != ESP_OK) {
         return fail(500, esp_err_to_name(err));
@@ -872,8 +935,9 @@ static const api_route_doc_t k_routes[] = {
     { "POST", "/api/ports/{port}/cycle",            true,  "Power off, wait off_ms (default 1000), power on; runs in the background", "{\"off_ms\":int,\"force\":bool}" },
     { "POST", "/api/ports/off",                     true,  "Power off every per-port switched port that does not lead to a hub", NULL },
     { "POST", "/api/ports/restore",                 true,  "Apply the saved power state to every port whose power does not match it", NULL },
-    { "GET",  "/api/settings",                      false, "Port power settings", NULL },
-    { "POST", "/api/settings",                      true,  "enforce_per_port_switching: refuse ganged/non-switching hubs unless forced; restore_port_power: keep ports switched off when their hub re-enumerates", "{\"enforce_per_port_switching\":bool,\"restore_port_power\":bool}" },
+    { "GET",  "/api/settings",                      false, "Port power and enumeration timeout settings", NULL },
+    { "POST", "/api/settings/enum_timeout",         true,  "Enumeration control transfer timeout: global (no path) or an override for a hub/port path and everything behind it; timeout_ms 0 = none, null removes an override", "{\"path\":str?,\"timeout_ms\":int|null}" },
+    { "POST", "/api/settings",                      true,  "enforce_per_port_switching: refuse ganged/non-switching hubs unless forced; restore_port_power: keep ports switched off when their hub re-enumerates; enum_timeout_ms: default enumeration timeout", "{\"enforce_per_port_switching\":bool,\"restore_port_power\":bool,\"enum_timeout_ms\":int}" },
     { "POST", "/api/ports/on",                      true,  "Power on every per-port switched port", NULL },
     { "GET",  "/api/status",                        false, "Analog mux state {active, manual, duts, groups}", NULL },
     { "GET",  "/api/duts",                          false, "Analog mux DUTs {active, duts}", NULL },
@@ -954,6 +1018,13 @@ static const mcp_tool_t k_tools[] = {
     { "set_port_power_settings", "Change the port power settings (omitted fields are unchanged).",
       "{\"type\":\"object\",\"properties\":{\"enforce_per_port_switching\":{\"type\":\"boolean\"},"
       "\"restore_port_power\":{\"type\":\"boolean\"}}}" },
+    { "set_enum_timeout",
+      "Set how long the USB host waits for a device to answer an enumeration control request before "
+      "disabling its port (so one unresponsive device cannot stop others enumerating). Without path: the "
+      "global default. With a hub or port path: an override for that device and everything behind it. "
+      "timeout_ms 0 = no timeout; null removes an override.",
+      "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
+      "\"timeout_ms\":{\"type\":[\"integer\",\"null\"]}},\"required\":[\"timeout_ms\"]}" },
     { "restore_port_power",
       "Apply the saved power state to every hub port whose actual power does not match it (list_hubs "
       "shows desired and mismatch per port).", NO_ARGS },
@@ -1030,6 +1101,9 @@ static api_result_t mcp_call_tool(const char *name, const cJSON *args)
     }
     if (strcmp(name, "set_port_power_settings") == 0) {
         return core_set_settings(args);
+    }
+    if (strcmp(name, "set_enum_timeout") == 0) {
+        return core_set_enum_timeout(args);
     }
     if (strcmp(name, "restore_port_power") == 0) {
         return core_restore();
@@ -1241,7 +1315,7 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
                        strncmp(path, "/api/select", 11) == 0 || path_is(path, "/api/isolate") ||
                        strncmp(path, "/api/groups/", 12) == 0 || path_is(path, "/api/topology") ||
                        path_is(path, "/api/probe") || strncmp(path, "/api/auth", 9) == 0 ||
-                       path_is(path, "/api/settings") ||
+                       strncmp(path, "/api/settings", 13) == 0 ||
                        path_is(path, "/api/reboot");
     if (!known) {
         return false;
@@ -1310,6 +1384,8 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
         r = core_ports_all(true);
     } else if (path_is(path, "/api/ports/restore") && is_method(method, "POST")) {
         r = core_restore();
+    } else if (path_is(path, "/api/settings/enum_timeout") && is_method(method, "POST")) {
+        r = core_set_enum_timeout(json);
     } else if (path_is(path, "/api/settings")) {
         r = is_method(method, "GET") ? core_get_settings() : core_set_settings(json);
     } else if (strncmp(path, "/api/ports/", 11) == 0) {

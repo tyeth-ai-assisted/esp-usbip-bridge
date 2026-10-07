@@ -215,11 +215,12 @@ Virtual devices are on bus 2.
 | GET | `/api/usb/devices/{busid}` | one device, 404 when absent (presence check) |
 | GET | `/api/usb/hubs` | hubs with their decoded `wHubCharacteristics` (power switching `per-port`/`ganged`/`none`, over-current mode, compound, TT think time, port indicators, PwrOn2PwrGood, controller current) and every port's state, saved state and mismatch |
 | GET | `/api/ports`, `/api/ports/{port}` | flat port list (also at `/ports`) |
-| POST | `/api/ports/{port}/on`, `/off` | SetPortFeature/ClearPortFeature PORT_POWER, body `{"force":bool}` |
+| POST | `/api/ports/{port}/on`, `/off` | SetPortFeature/ClearPortFeature PORT_POWER, body `{"force":bool}`. `202` with `"pending": true` when the port is busy (e.g. its device is enumerating): the request is applied in the background |
 | POST | `/api/ports/{port}/cycle` | off, wait `off_ms` (default 1000), on; runs in the background |
 | POST | `/api/ports/off`, `/api/ports/on` | every per-port switched port that does not lead to a hub |
 | POST | `/api/ports/restore` | switch every port whose power differs from its saved state back to it |
-| GET/POST | `/api/settings` | `{"enforce_per_port_switching": bool, "restore_port_power": bool}` |
+| GET/POST | `/api/settings` | `{"enforce_per_port_switching": bool, "restore_port_power": bool, "enum_timeout_ms": int}` |
+| POST | `/api/settings/enum_timeout` | `{"path": "1-1.3", "timeout_ms": int\|null}`: enumeration timeout override for a hub or port path and everything behind it (no path = global, `null` removes) |
 | POST | `/api/usb/debug` | log the USB host's hub, port and enumeration state to the console |
 
 Port power is refused (409) unless `force` is set when the hub does not report
@@ -234,6 +235,20 @@ The USB host library keeps such ports unpowered from the start, so the DUT never
 sees VBUS. With it off, ports come back powered and show `mismatch` until
 `POST /api/ports/restore`. Both settings are toggles on the web page's
 Hubs & Power tab.
+
+Requests never wait for a busy port: requests for a port whose device is
+enumerating are queued and applied in the background (each port on its own),
+and power cycles of several ports run in parallel.
+
+**Enumeration timeout.** Devices are enumerated one at a time, so a device that
+never answers would stop every other device from enumerating. If an enumeration
+control transfer does not complete within `enum_timeout_ms` (default 2000 ms,
+0 = no timeout) the device's port is disabled and enumeration carries on; power
+cycle the port to try that device again. USB 2.0 gives a device 500 ms for the
+first data packet of a request and 50 ms for a status stage, so 1000 ms is the
+shortest sensible global value; slow-booting boards that NAK while starting up
+can get a longer per-port or per-hub override (Hubs & Power tab, or
+`POST /api/settings/enum_timeout`).
 
 ### I2C strand mux
 
@@ -264,7 +279,7 @@ JSON responses) with tools `list_usb_devices`, `get_usb_device`, `list_hubs`,
 `set_port_power`, `power_cycle_port`, `set_device_name`, `mux_status`,
 `mux_select`, `mux_isolate`, `mux_set_channel`, `mux_get_topology`,
 `mux_set_topology`, `get_port_power_settings`, `set_port_power_settings`,
-`restore_port_power` and `get_bridge_info`. For example with Claude Code:
+`set_enum_timeout`, `restore_port_power` and `get_bridge_info`. For example with Claude Code:
 
 ```bash
 claude mcp add --transport http usbip-bridge http://usbip-xxxxxx.local/mcp
