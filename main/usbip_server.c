@@ -136,6 +136,55 @@ static bool send_device_with_interfaces(int fd, const usbip_backend_device_t *de
     return true;
 }
 
+/* RET_SUBMIT/RET_UNLINK status values are Linux errno values, and
+   ESP-IDF's newlib numbers some errno constants differently (ETIMEDOUT is
+   116 there but 110 on Linux, where 116 is ESTALE).  Translate the ones a
+   URB status can carry; anything else becomes -EIO. */
+#define USBIP_LINUX_EPROTO      71
+#define USBIP_LINUX_EOVERFLOW   75
+#define USBIP_LINUX_EILSEQ      84
+#define USBIP_LINUX_EMSGSIZE    90
+#define USBIP_LINUX_ECONNRESET  104
+#define USBIP_LINUX_ESHUTDOWN   108
+#define USBIP_LINUX_ETIMEDOUT   110
+#define USBIP_LINUX_EINPROGRESS 115
+
+/* These are passed through, so newlib must agree with Linux on them. */
+_Static_assert(ENOENT == 2 && EIO == 5 && ENXIO == 6 && EAGAIN == 11 && ENOMEM == 12
+               && EBUSY == 16 && EXDEV == 18 && ENODEV == 19 && EINVAL == 22
+               && ENOSPC == 28 && EPIPE == 32 && ENOSR == 63 && ECOMM == 70
+               && EPROTO == USBIP_LINUX_EPROTO && EOPNOTSUPP == 95
+               && ECONNRESET == USBIP_LINUX_ECONNRESET,
+               "newlib errno differs from Linux; add it to to_linux_errno()");
+
+static int32_t to_linux_errno(int32_t status)
+{
+    if (status >= 0) {
+        return status;
+    }
+    switch (-status) {
+    case ENOENT: case EIO: case ENXIO: case EAGAIN: case ENOMEM:
+    case EBUSY: case EXDEV: case ENODEV: case EINVAL: case ENOSPC:
+    case EPIPE: case ENOSR: case ECOMM: case EPROTO: case EOPNOTSUPP:
+    case ECONNRESET:
+        return status;
+    case EOVERFLOW:
+        return -USBIP_LINUX_EOVERFLOW;
+    case EILSEQ:
+        return -USBIP_LINUX_EILSEQ;
+    case EMSGSIZE:
+        return -USBIP_LINUX_EMSGSIZE;
+    case ESHUTDOWN:
+        return -USBIP_LINUX_ESHUTDOWN;
+    case ETIMEDOUT:
+        return -USBIP_LINUX_ETIMEDOUT;
+    case EINPROGRESS:
+        return -USBIP_LINUX_EINPROGRESS;
+    default:
+        return -EIO;
+    }
+}
+
 static bool send_op_common(int fd, uint16_t code, uint32_t status)
 {
     usbip_op_common_t reply = {
@@ -162,7 +211,7 @@ static bool send_ret_submit(int fd,
     reply.base.direction = request->base.direction;
     reply.base.ep = request->base.ep;
 
-    reply.u.ret_submit.status = htonl((uint32_t)status);
+    reply.u.ret_submit.status = htonl((uint32_t)to_linux_errno(status));
     reply.u.ret_submit.actual_length = htonl(payload_len);
     reply.u.ret_submit.start_frame = htonl(0);
     reply.u.ret_submit.number_of_packets = htonl(0);
@@ -199,7 +248,7 @@ static bool send_ret_submit_out(int fd, const usbip_header_t *request,
     reply.base.direction = request->base.direction;
     reply.base.ep = request->base.ep;
 
-    reply.u.ret_submit.status = htonl((uint32_t)status);
+    reply.u.ret_submit.status = htonl((uint32_t)to_linux_errno(status));
     reply.u.ret_submit.actual_length = htonl(actual_length);
 
     return write_all(fd, &reply, sizeof(reply));
@@ -216,7 +265,7 @@ static bool send_ret_unlink(int fd, const usbip_header_t *request, int32_t statu
     reply.base.direction = request->base.direction;
     reply.base.ep = request->base.ep;
 
-    reply.u.ret_unlink.status = htonl((uint32_t)status);
+    reply.u.ret_unlink.status = htonl((uint32_t)to_linux_errno(status));
 
     return write_all(fd, &reply, sizeof(reply));
 }
