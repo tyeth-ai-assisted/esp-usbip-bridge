@@ -17,6 +17,7 @@
 #include "device_naming.h"
 #include "discovery_service.h"
 #include "hub_control.h"
+#include "usb/usb_types_stack.h"
 #include "usb_backend.h"
 #include "virtual_device.h"
 #include "version_autogen.h"
@@ -743,6 +744,170 @@ static api_result_t core_set_settings(const cJSON *args)
     return result(200, j);
 }
 
+static const char *enum_kind_name(uint8_t kind)
+{
+    switch (kind) {
+    case USB_HOST_ENUM_EVENT_STARTED: return "started";
+    case USB_HOST_ENUM_EVENT_COMPLETED: return "completed";
+    default: return "failed";
+    }
+}
+
+static const char *transfer_status_name(int status)
+{
+    switch (status) {
+    case USB_TRANSFER_STATUS_COMPLETED: return "completed";
+    case USB_TRANSFER_STATUS_ERROR: return "error";
+    case USB_TRANSFER_STATUS_TIMED_OUT: return "timed_out";
+    case USB_TRANSFER_STATUS_CANCELED: return "canceled";
+    case USB_TRANSFER_STATUS_STALL: return "stall";
+    case USB_TRANSFER_STATUS_OVERFLOW: return "overflow";
+    case USB_TRANSFER_STATUS_SKIPPED: return "skipped";
+    case USB_TRANSFER_STATUS_NO_DEVICE: return "no_device";
+    default: return NULL;
+    }
+}
+
+/* What a failure says about the device */
+static const char *enum_fail_diagnosis(const hub_ctl_enum_event_t *e)
+{
+    switch (e->fail_reason) {
+    case USB_HOST_ENUM_FAIL_TIMEOUT:
+        return "no answer within the timeout: device connected but slow or stalled (NAKing); transfer aborted, port retried";
+    case USB_HOST_ENUM_FAIL_DISCONNECTED:
+        return "device disconnected during enumeration: rebooting or unplugged";
+    default:
+        if (e->transfer_status == USB_TRANSFER_STATUS_STALL) {
+            return "device rejected a request (STALL)";
+        }
+        if (e->transfer_status == USB_TRANSFER_STATUS_NO_DEVICE ||
+                e->transfer_status == USB_TRANSFER_STATUS_ERROR) {
+            return "transfer error: device reset or dropped off the bus (typically rebooting)";
+        }
+        return "transfer failed or returned bad data";
+    }
+}
+
+static cJSON *enum_event_json(const hub_ctl_enum_event_t *log, size_t n, size_t i, uint32_t now_ms)
+{
+    const hub_ctl_enum_event_t *e = &log[i];
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddNumberToObject(o, "t_ms", e->t_ms);
+    cJSON_AddNumberToObject(o, "age_ms", now_ms - e->t_ms);
+    cJSON_AddStringToObject(o, "path", e->path);
+    cJSON_AddStringToObject(o, "event", enum_kind_name(e->kind));
+    if (e->kind == USB_HOST_ENUM_EVENT_STARTED) {
+        cJSON_AddNumberToObject(o, "timeout_ms", e->timeout_ms);
+        return o;
+    }
+    cJSON_AddNumberToObject(o, "elapsed_ms", e->elapsed_ms);
+    if (e->kind == USB_HOST_ENUM_EVENT_COMPLETED) {
+        add_hex(o, "vid", e->vid, 4);
+        add_hex(o, "pid", e->pid, 4);
+        cJSON_AddNumberToObject(o, "address", e->dev_addr);
+        return o;
+    }
+    static const char *const reasons[] = { "none", "timeout", "transfer_error", "disconnected" };
+    cJSON_AddStringToObject(o, "reason", e->fail_reason < 4 ? reasons[e->fail_reason] : "unknown");
+    add_str_or_null(o, "stage", e->stage);
+    add_str_or_null(o, "transfer_status", transfer_status_name(e->transfer_status));
+    cJSON_AddNumberToObject(o, "timeout_ms", e->timeout_ms);
+    cJSON_AddStringToObject(o, "diagnosis", enum_fail_diagnosis(e));
+    /* What happened next on this port */
+    const char *outcome = "not re-enumerated yet";
+    int32_t after_ms = -1;
+    for (size_t k = i + 1; k < n; k++) {
+        if (strcmp(log[k].path, e->path) != 0) {
+            continue;
+        }
+        if (log[k].kind == USB_HOST_ENUM_EVENT_COMPLETED) {
+            outcome = "re-enumerated";
+            after_ms = (int32_t)(log[k].t_ms - e->t_ms);
+            break;
+        }
+        if (log[k].kind == USB_HOST_ENUM_EVENT_FAILED) {
+            outcome = "failed again";
+            after_ms = (int32_t)(log[k].t_ms - e->t_ms);
+            break;
+        }
+    }
+    cJSON_AddStringToObject(o, "outcome", outcome);
+    if (after_ms >= 0) {
+        cJSON_AddNumberToObject(o, "outcome_after_ms", after_ms);
+    }
+    return o;
+}
+
+static api_result_t core_enum_events(void)
+{
+    hub_ctl_enum_event_t *log = malloc(HUB_CTL_ENUM_LOG_LEN * sizeof(*log));
+    if (log == NULL) {
+        return fail(503, "out of memory");
+    }
+    size_t n = hub_ctl_get_enum_log(log, HUB_CTL_ENUM_LOG_LEN);
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    cJSON *j = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(j, "events");
+    size_t failures = 0;
+    for (size_t i = n; i-- > 0;) {      /* newest first */
+        cJSON_AddItemToArray(arr, enum_event_json(log, n, i, now_ms));
+        failures += (log[i].kind == USB_HOST_ENUM_EVENT_FAILED);
+    }
+    cJSON_AddNumberToObject(j, "failures", failures);
+
+    /* Per port: how often it enumerated, how it failed, and what that says */
+    cJSON *ports = cJSON_AddObjectToObject(j, "ports");
+    for (size_t i = 0; i < n; i++) {
+        if (cJSON_GetObjectItemCaseSensitive(ports, log[i].path) != NULL) {
+            continue;
+        }
+        uint32_t completed = 0, timeouts = 0, resets = 0, first_ok = 0, last_ok = 0;
+        for (size_t k = i; k < n; k++) {
+            if (strcmp(log[k].path, log[i].path) != 0) {
+                continue;
+            }
+            if (log[k].kind == USB_HOST_ENUM_EVENT_COMPLETED) {
+                if (completed++ == 0) {
+                    first_ok = log[k].t_ms;
+                }
+                last_ok = log[k].t_ms;
+            } else if (log[k].kind == USB_HOST_ENUM_EVENT_FAILED) {
+                if (log[k].fail_reason == USB_HOST_ENUM_FAIL_TIMEOUT) {
+                    timeouts++;
+                } else {
+                    resets++;
+                }
+            }
+        }
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "enumerations", completed);
+        cJSON_AddNumberToObject(o, "timeouts", timeouts);
+        cJSON_AddNumberToObject(o, "resets_during_enumeration", resets);
+        if (completed > 0) {
+            cJSON_AddNumberToObject(o, "last_enumerated_ms_ago", now_ms - last_ok);
+        }
+        const char *verdict;
+        if (timeouts > 0) {
+            /* No answer while connected: slow or stalled; the port keeps being retried */
+            verdict = completed > 0 ? "stalled at times (timed out, recovered on retry)"
+                                    : "stalled: connected but not answering (retrying with back-off)";
+        } else if (completed > 1 || resets > 0) {
+            /* Enumerated repeatedly (each time after a disconnect) or dropped mid-enumeration */
+            verdict = "rebooting: disconnects and re-enumerates";
+            if (completed > 1) {
+                cJSON_AddNumberToObject(o, "mean_interval_ms", (last_ok - first_ok) / (completed - 1));
+            }
+        } else {
+            verdict = "ok";
+        }
+        cJSON_AddStringToObject(o, "verdict", verdict);
+        cJSON_AddItemToObject(ports, log[i].path, o);
+    }
+    cJSON_AddNumberToObject(j, "window_ms", n ? now_ms - log[0].t_ms : 0);
+    free(log);
+    return result(200, j);
+}
+
 static api_result_t core_restore(void)
 {
     int n = hub_ctl_restore_now();
@@ -927,6 +1092,7 @@ static const api_route_doc_t k_routes[] = {
     { "GET",  "/api/usb/devices/{busid}",           false, "One device; 404 when absent (presence check)", NULL },
     { "POST", "/api/devices/{busid}/name",          true,  "Set a friendly name for the device on a port", "{\"name\":str}" },
     { "GET",  "/api/usb/hubs",                      false, "Hubs with power switching mode and per-port status", NULL },
+    { "GET",  "/api/usb/enum_events",               false, "Recent enumerations (newest first): starts, completions and failures with reason, stage, diagnosis (rebooting vs slow/stalled) and what happened next", NULL },
     { "POST", "/api/usb/debug",                     false, "Log the USB host's hub, port and enumeration state to the console (diagnostics)", NULL },
     { "GET",  "/api/ports",                         false, "Every downstream hub port (alias /ports)", NULL },
     { "GET",  "/api/ports/{port}",                  false, "One port, e.g. 1-1.3", NULL },
@@ -1018,6 +1184,10 @@ static const mcp_tool_t k_tools[] = {
     { "set_port_power_settings", "Change the port power settings (omitted fields are unchanged).",
       "{\"type\":\"object\",\"properties\":{\"enforce_per_port_switching\":{\"type\":\"boolean\"},"
       "\"restore_port_power\":{\"type\":\"boolean\"}}}" },
+    { "get_enum_events",
+      "Recent USB enumerations with failures diagnosed: a timeout means the device stayed connected but did "
+      "not answer (slow or stalled); a disconnect or transfer error means it reset or rebooted. Each failure "
+      "says whether the port enumerated again afterwards and how soon.", NO_ARGS },
     { "set_enum_timeout",
       "Set how long the USB host waits for a device to answer an enumeration control request before "
       "disabling its port (so one unresponsive device cannot stop others enumerating). Without path: the "
@@ -1101,6 +1271,9 @@ static api_result_t mcp_call_tool(const char *name, const cJSON *args)
     }
     if (strcmp(name, "set_port_power_settings") == 0) {
         return core_set_settings(args);
+    }
+    if (strcmp(name, "get_enum_events") == 0) {
+        return core_enum_events();
     }
     if (strcmp(name, "set_enum_timeout") == 0) {
         return core_set_enum_timeout(args);
@@ -1369,6 +1542,8 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
         r = core_device(seg);
     } else if (path_is(path, "/api/usb/hubs")) {
         r = core_hubs();
+    } else if (path_is(path, "/api/usb/enum_events")) {
+        r = core_enum_events();
     } else if (path_is(path, "/api/usb/debug")) {
         /* Diagnostics: the USB host's hub/port/enumeration state goes to the console */
         esp_err_t err = usb_host_hub_debug_dump();

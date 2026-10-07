@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 
@@ -55,6 +56,9 @@ static hub_ctl_settings_t s_settings = {
 };
 static hub_ctl_timeout_override_t s_timeouts[HUB_CTL_MAX_TIMEOUT_OVERRIDES];
 static size_t s_timeout_count;
+static hub_ctl_enum_event_t s_enum_log[HUB_CTL_ENUM_LOG_LEN];
+static size_t s_enum_log_head;      /* next slot */
+static size_t s_enum_log_count;
 static char s_off_ports[HUB_CTL_MAX_SAVED_PORTS][HUB_CTL_SAVED_PATH_LEN];
 static size_t s_off_count;
 
@@ -274,6 +278,47 @@ static uint32_t enum_timeout_cb(const usb_host_hub_port_path_t *path, void *arg)
     return ms >= 0 ? (uint32_t)ms : USB_HOST_ENUM_TIMEOUT_DEFAULT;
 }
 
+/* Enumeration events from the USB Host Library task: just record them. */
+static void enum_event_cb(const usb_host_enum_event_t *ev, void *arg)
+{
+    (void)arg;
+    hub_ctl_enum_event_t e = {
+        .t_ms = (uint32_t)(esp_timer_get_time() / 1000),
+        .kind = (uint8_t)ev->kind,
+        .fail_reason = (uint8_t)ev->fail_reason,
+        .stage = ev->stage,
+        .transfer_status = (int16_t)ev->transfer_status,
+        .elapsed_ms = ev->elapsed_ms,
+        .timeout_ms = ev->timeout_ms,
+        .dev_addr = ev->dev_addr,
+        .vid = ev->vid,
+        .pid = ev->pid,
+    };
+    size_t off = strlcpy(e.path, "1-1", sizeof(e.path));
+    for (uint8_t i = 0; i < ev->path.depth && off < sizeof(e.path); i++) {
+        off += snprintf(e.path + off, sizeof(e.path) - off, ".%u", ev->path.ports[i]);
+    }
+    portENTER_CRITICAL(&s_lock);
+    s_enum_log[s_enum_log_head] = e;
+    s_enum_log_head = (s_enum_log_head + 1) % HUB_CTL_ENUM_LOG_LEN;
+    if (s_enum_log_count < HUB_CTL_ENUM_LOG_LEN) {
+        s_enum_log_count++;
+    }
+    portEXIT_CRITICAL(&s_lock);
+}
+
+size_t hub_ctl_get_enum_log(hub_ctl_enum_event_t *out, size_t max)
+{
+    portENTER_CRITICAL(&s_lock);
+    size_t n = s_enum_log_count < max ? s_enum_log_count : max;
+    size_t start = (s_enum_log_head + HUB_CTL_ENUM_LOG_LEN - n) % HUB_CTL_ENUM_LOG_LEN;
+    for (size_t i = 0; i < n; i++) {
+        out[i] = s_enum_log[(start + i) % HUB_CTL_ENUM_LOG_LEN];
+    }
+    portEXIT_CRITICAL(&s_lock);
+    return n;
+}
+
 void hub_ctl_get_settings(hub_ctl_settings_t *out)
 {
     portENTER_CRITICAL(&s_lock);
@@ -373,6 +418,7 @@ esp_err_t hub_ctl_init(void)
     usb_host_hub_set_port_policy(port_policy_cb, NULL);
     usb_host_set_enum_timeout(s_settings.enum_timeout_ms);
     usb_host_set_enum_timeout_cb(enum_timeout_cb, NULL);
+    usb_host_set_enum_event_cb(enum_event_cb, NULL);
     ESP_LOGI(TAG, "Enforce per-port switching %s, restore on hub reset %s, %u port(s) saved off",
              s_settings.enforce_per_port ? "on" : "off", s_settings.restore_on_reset ? "on" : "off",
              (unsigned)s_off_count);

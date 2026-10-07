@@ -80,6 +80,26 @@ size_t hub_ctl_get_enum_timeouts(hub_ctl_timeout_override_t *out, size_t max);
 /* Effective timeout for a device at `path` (`is_override` may be NULL). */
 uint32_t hub_ctl_enum_timeout_for(const char *path, bool *is_override);
 
+/* Enumeration log: every enumeration start, completion and failure (newest
+   last), recorded from the USB Host Library. */
+#define HUB_CTL_ENUM_LOG_LEN 48
+
+typedef struct {
+    uint32_t t_ms;              /* bridge uptime */
+    char path[16];              /* port path of the device */
+    uint8_t kind;               /* usb_host_enum_event_kind_t */
+    uint8_t fail_reason;        /* usb_host_enum_fail_t */
+    const char *stage;          /* failing stage */
+    int16_t transfer_status;    /* usb_transfer_status_t, -1 if n/a */
+    uint32_t elapsed_ms;
+    uint32_t timeout_ms;
+    uint8_t dev_addr;
+    uint16_t vid;
+    uint16_t pid;
+} hub_ctl_enum_event_t;
+
+size_t hub_ctl_get_enum_log(hub_ctl_enum_event_t *out, size_t max);
+
 /* Names of wHubCharacteristics fields. */
 const char *hub_ctl_power_switching_name(uint8_t power_switching);
 const char *hub_ctl_over_current_name(uint8_t over_current_protection);
