@@ -186,6 +186,25 @@ static bool send_ret_submit(int fd,
     return write_all(fd, &reply, sizeof(reply));
 }
 
+/* RET_SUBMIT for an OUT URB: actual_length without a payload. */
+static bool send_ret_submit_out(int fd, const usbip_header_t *request,
+                                int32_t status, uint32_t actual_length)
+{
+    usbip_header_t reply;
+    memset(&reply, 0, sizeof(reply));
+
+    reply.base.command = htonl(USBIP_RET_SUBMIT);
+    reply.base.seqnum = request->base.seqnum;
+    reply.base.devid = request->base.devid;
+    reply.base.direction = request->base.direction;
+    reply.base.ep = request->base.ep;
+
+    reply.u.ret_submit.status = htonl((uint32_t)status);
+    reply.u.ret_submit.actual_length = htonl(actual_length);
+
+    return write_all(fd, &reply, sizeof(reply));
+}
+
 static bool send_ret_unlink(int fd, const usbip_header_t *request, int32_t status)
 {
     usbip_header_t reply;
@@ -382,10 +401,16 @@ static void urb_process(urb_work_item_t *item)
     xSemaphoreTake(ctx->write_mutex, portMAX_DELAY);
     if (item->unlinked) {
         send_ret_unlink(ctx->fd, &item->unlink_request, -ECONNRESET);
-    } else {
+    } else if (direction == USBIP_DIR_IN) {
         send_ret_submit(ctx->fd, &item->request, status,
-                        (status == 0 && direction == USBIP_DIR_IN) ? item->in_data : NULL,
-                        (status == 0 && direction == USBIP_DIR_IN) ? (uint32_t)in_len : 0);
+                        status == 0 ? item->in_data : NULL,
+                        status == 0 ? (uint32_t)in_len : 0);
+    } else {
+        /* OUT: actual_length is the number of bytes sent, with no payload.
+           Clients check it (picotool treats a short PICOBOOT command write
+           as a failure); the backend sends all or fails. */
+        send_ret_submit_out(ctx->fd, &item->request, status,
+                            status == 0 ? (uint32_t)item->out_len : 0);
     }
     urb_stream_free_slot(ctx, item->slot);
     xSemaphoreGive(ctx->write_mutex);
