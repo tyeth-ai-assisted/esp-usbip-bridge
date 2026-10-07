@@ -67,6 +67,8 @@ typedef struct {
     volatile bool submitted;        /* true = transfer handed to DWC hw */
     volatile bool completed;        /* true = DWC callback has fired */
     volatile bool aborted;          /* true = we forced abort (timeout/cancel) */
+    bool orphaned;                  /* caller answered, transfer still in flight (state_mutex) */
+    bool caller_left;               /* caller returned while orphaned (state_mutex) */
 
     char busid[32];
     uint8_t endpoint_addr;          /* 0 for control, 0x8N for IN, 0x0N for OUT */
@@ -974,6 +976,55 @@ static int complete_transfer(usb_backend_pipe_req_t *pipe)
     return status;
 }
 
+/* Answer the caller of an aborted transfer that is still in flight, and
+   keep its slot (and the transfer) until the completion callback fires. */
+static void orphan_transfer(usb_backend_pipe_req_t *pipe)
+{
+    const int status = (pipe->cancel != NULL && *pipe->cancel) ? -ECONNRESET : -ETIMEDOUT;
+    ESP_LOGD(TAG, "%s ep 0x%02x: aborted transfer still in flight, holding its slot",
+             pipe->busid, pipe->endpoint_addr);
+
+    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+    pipe->orphaned = true;
+    xSemaphoreGive(s_state.state_mutex);
+
+    pipe->active = false;
+    if (pipe->status_out != NULL) {
+        *pipe->status_out = status;
+    }
+    /* Everything below belongs to the caller, which returns now. */
+    pipe->status_out = NULL;
+    pipe->in_len_out = NULL;
+    pipe->in_data = NULL;
+    pipe->out_data = NULL;
+    pipe->cancel = NULL;
+    xSemaphoreGive(pipe->done_sem);
+}
+
+/* The orphaned transfer has completed: free it and the slot.  If the caller
+   has not looked at the slot yet, it releases the slot itself. */
+static void release_orphan(usb_backend_pipe_req_t *pipe)
+{
+    usb_host_transfer_free(pipe->xfer);
+    pipe->xfer = NULL;
+    pipe->submitted = false;
+    pipe->completed = false;
+    pipe->aborted = false;
+
+    bool give = false;
+    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+    pipe->orphaned = false;
+    if (pipe->caller_left) {
+        pipe->caller_left = false;
+        pipe->assigned = false;
+        give = true;
+    }
+    xSemaphoreGive(s_state.state_mutex);
+    if (give) {
+        xSemaphoreGive(s_state.pipe_avail_sem);
+    }
+}
+
 static void usb_backend_daemon_task(void *arg)
 {
     (void)arg;
@@ -1057,6 +1108,12 @@ static void usb_backend_task(void *arg)
             if (!pipe->submitted) {
                 continue;
             }
+            if (pipe->orphaned) {
+                if (pipe->completed) {
+                    release_orphan(pipe);
+                }
+                continue;
+            }
 
             /* Detect external cancel requests. */
             if (!pipe->aborted && pipe->cancel != NULL && *pipe->cancel) {
@@ -1083,6 +1140,16 @@ static void usb_backend_task(void *arg)
                                                   pdMS_TO_TICKS(10));
                 }
                 usb_host_endpoint_clear(pipe->dev_hdl, pipe->endpoint_addr);
+            }
+
+            /* The host library cannot cancel a control transfer, and an
+               aborted transfer may still be in flight after the halt/flush
+               above.  Freeing it then lets the stack write into freed heap,
+               so answer the caller now and hold the slot until the transfer
+               really completes (the device answers, or is gone). */
+            if (pipe->aborted && !pipe->completed) {
+                orphan_transfer(pipe);
+                continue;
             }
 
             /* If the transfer has completed (callback fired) or we've
@@ -1396,11 +1463,21 @@ static int submit_pipe_request(const char busid[32],
     xSemaphoreTake(pipe->done_sem, portMAX_DELAY);
 
     /* Return the pipe slot to the shared pool.  Only clear assigned;
-       active/submitted are owned by the backend task. */
+       active/submitted are owned by the backend task.  An orphaned slot
+       (aborted, transfer still in flight) is released by the backend task
+       once the transfer completes. */
+    bool give = true;
     xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
-    pipe->assigned = false;
+    if (pipe->orphaned) {
+        pipe->caller_left = true;
+        give = false;
+    } else {
+        pipe->assigned = false;
+    }
     xSemaphoreGive(s_state.state_mutex);
-    xSemaphoreGive(s_state.pipe_avail_sem);
+    if (give) {
+        xSemaphoreGive(s_state.pipe_avail_sem);
+    }
 
     return status;
 }
