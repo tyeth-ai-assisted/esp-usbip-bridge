@@ -92,6 +92,7 @@ typedef struct {
 typedef struct {
     bool in_use;
     bool interfaces_claimed;
+    uint32_t halted_eps;            /* endpoints halted by a STALL (see ep_halt_bit()) */
     usb_device_handle_t dev_hdl;
     usbip_backend_device_t device;
 } usb_backend_device_slot_t;
@@ -636,9 +637,162 @@ static int map_transfer_status_to_errno(usb_transfer_status_t status)
         return -EPIPE;
     case USB_TRANSFER_STATUS_NO_DEVICE:
         return -ENODEV;
+    case USB_TRANSFER_STATUS_ERROR:
+        return -EPROTO;
+    case USB_TRANSFER_STATUS_OVERFLOW:
+        return -EOVERFLOW;
     default:
         return -EIO;
     }
+}
+
+/* Bit for an endpoint in usb_backend_device_slot_t.halted_eps: OUT
+   endpoints in bits 0-15, IN endpoints in bits 16-31. */
+static uint32_t ep_halt_bit(uint8_t endpoint_addr)
+{
+    return 1u << ((endpoint_addr & 0x0f) + ((endpoint_addr & 0x80) ? 16 : 0));
+}
+
+/* Collect the endpoints of the claimed (alternate setting 0) interfaces,
+   or of one interface when intf_filter >= 0. */
+static int collect_claimed_endpoints_locked(int dev_slot, int intf_filter,
+                                            uint8_t *out, int max)
+{
+    int count = 0;
+    const usb_config_desc_t *cfg = NULL;
+    if (usb_host_get_active_config_descriptor(s_state.devices[dev_slot].dev_hdl, &cfg) != ESP_OK
+        || cfg == NULL) {
+        return 0;
+    }
+    for (int intf_num = 0; intf_num < s_state.devices[dev_slot].device.num_interfaces; intf_num++) {
+        if (intf_filter >= 0 && intf_num != intf_filter) {
+            continue;
+        }
+        int offset = 0;
+        const usb_intf_desc_t *intf = usb_parse_interface_descriptor(cfg, intf_num, 0, &offset);
+        if (intf == NULL) {
+            continue;
+        }
+        for (int i = 0; i < intf->bNumEndpoints && count < max; i++) {
+            int ep_offset = offset;
+            const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(intf, i, cfg->wTotalLength, &ep_offset);
+            if (ep != NULL) {
+                out[count++] = ep->bEndpointAddress;
+            }
+        }
+    }
+    return count;
+}
+
+/* Reset a host endpoint after a request that reset the device's data
+   toggle for it (USB 2.0 9.4.5): halt (cancels a transfer in flight),
+   flush, start the toggle again at DATA0 and make the pipe active.
+   Runs in the backend task, like the abort path. */
+static void reset_host_endpoint(usb_device_handle_t dev_hdl, uint8_t endpoint_addr)
+{
+    usb_host_endpoint_halt(dev_hdl, endpoint_addr);
+    usb_host_endpoint_flush(dev_hdl, endpoint_addr);
+    esp_err_t err = usb_host_endpoint_reset_toggle(dev_hdl, endpoint_addr);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "reset toggle failed: %s (ep=0x%02x)", esp_err_to_name(err), endpoint_addr);
+    }
+    usb_host_endpoint_clear(dev_hdl, endpoint_addr);
+}
+
+/* Linux usbip-host applies CLEAR_FEATURE(ENDPOINT_HALT), SET_INTERFACE and
+   SET_CONFIGURATION to its own host controller as well (stub_rx.c
+   tweak_*_cmd()).  Mirror that once the device has accepted the request:
+   the device's toggles are back at DATA0, so ours must be too, and an
+   endpoint halted by a STALL becomes usable again. */
+static void apply_standard_request_to_host(const usb_backend_pipe_req_t *pipe)
+{
+    const usb_setup_packet_t *setup = &pipe->setup;
+    const uint8_t std_out = USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_STANDARD;
+    int intf_filter;
+
+    if (setup->bmRequestType == (std_out | USB_BM_REQUEST_TYPE_RECIP_ENDPOINT)
+        && setup->bRequest == USB_B_REQUEST_CLEAR_FEATURE
+        && setup->wValue == 0 /* ENDPOINT_HALT */) {
+        intf_filter = -2;   /* the endpoint in wIndex */
+    } else if (setup->bmRequestType == (std_out | USB_BM_REQUEST_TYPE_RECIP_INTERFACE)
+               && setup->bRequest == USB_B_REQUEST_SET_INTERFACE) {
+        intf_filter = setup->wIndex & 0xff;
+    } else if (setup->bmRequestType == (std_out | USB_BM_REQUEST_TYPE_RECIP_DEVICE)
+               && setup->bRequest == USB_B_REQUEST_SET_CONFIGURATION) {
+        intf_filter = -1;   /* every interface */
+    } else {
+        return;
+    }
+
+    uint8_t eps[USBIP_MAX_ENDPOINTS];
+    int num_eps = 0;
+
+    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+    const int dev_slot = find_slot_by_busid_locked(pipe->busid);
+    if (dev_slot < 0) {
+        xSemaphoreGive(s_state.state_mutex);
+        return;
+    }
+    usb_backend_device_slot_t *dev = &s_state.devices[dev_slot];
+    if (intf_filter == -2) {
+        const uint8_t ep = setup->wIndex & 0xff;
+        if ((ep & 0x0f) != 0) {
+            eps[num_eps++] = ep;
+        }
+    } else {
+        if (intf_filter >= 0 && (setup->wValue & 0xff) != 0) {
+            ESP_LOGW(TAG, "%s: SET_INTERFACE %d alt %d; only alt 0 endpoints are mapped",
+                     pipe->busid, intf_filter, setup->wValue & 0xff);
+        }
+        num_eps = collect_claimed_endpoints_locked(dev_slot, intf_filter, eps, USBIP_MAX_ENDPOINTS);
+    }
+    for (int i = 0; i < num_eps; i++) {
+        dev->halted_eps &= ~ep_halt_bit(eps[i]);
+    }
+    /* Pipes are allocated (at DATA0) when the interfaces are claimed, so
+       there is nothing to reset before the first non-control transfer. */
+    const bool claimed = dev->interfaces_claimed;
+    const usb_device_handle_t dev_hdl = dev->dev_hdl;
+    xSemaphoreGive(s_state.state_mutex);
+
+    if (!claimed) {
+        return;
+    }
+    for (int i = 0; i < num_eps; i++) {
+        ESP_LOGD(TAG, "%s: reset host endpoint 0x%02x (bRequest %u)",
+                 pipe->busid, eps[i], setup->bRequest);
+        reset_host_endpoint(dev_hdl, eps[i]);
+    }
+}
+
+/* After a non-control transfer failed: a STALL leaves the host pipe halted
+   until the client sends CLEAR_FEATURE(ENDPOINT_HALT), and URBs for the
+   endpoint fail with -EPIPE meanwhile (as on Linux).  Any other error
+   halts the pipe too, but the device is not halted, so the pipe is made
+   active again straight away (the toggle is still right). */
+static void note_transfer_failure(const usb_backend_pipe_req_t *pipe, usb_transfer_status_t usb_status)
+{
+    if (usb_status == USB_TRANSFER_STATUS_STALL) {
+        xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+        const int dev_slot = find_slot_by_busid_locked(pipe->busid);
+        if (dev_slot >= 0) {
+            s_state.devices[dev_slot].halted_eps |= ep_halt_bit(pipe->endpoint_addr);
+        }
+        xSemaphoreGive(s_state.state_mutex);
+    } else if (usb_status == USB_TRANSFER_STATUS_ERROR
+               || usb_status == USB_TRANSFER_STATUS_OVERFLOW) {
+        usb_host_endpoint_clear(pipe->dev_hdl, pipe->endpoint_addr);
+    }
+}
+
+static bool endpoint_is_halted(const usb_backend_pipe_req_t *pipe)
+{
+    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+    const int dev_slot = find_slot_by_busid_locked(pipe->busid);
+    const bool halted = dev_slot >= 0
+        && (s_state.devices[dev_slot].halted_eps & ep_halt_bit(pipe->endpoint_addr)) != 0;
+    xSemaphoreGive(s_state.state_mutex);
+    return halted;
 }
 
 static uint16_t get_endpoint_mps_locked(int dev_slot, uint8_t endpoint_addr)
@@ -687,6 +841,10 @@ static int prepare_and_submit_transfer(usb_backend_pipe_req_t *pipe)
             if (claim_err != ESP_OK) {
                 xSemaphoreGive(s_state.state_mutex);
                 return -EIO;
+            }
+            if (s_state.devices[dev_slot].halted_eps & ep_halt_bit(pipe->endpoint_addr)) {
+                xSemaphoreGive(s_state.state_mutex);
+                return -EPIPE;
             }
         }
         pipe->dev_hdl = s_state.devices[dev_slot].dev_hdl;
@@ -747,7 +905,12 @@ static int prepare_and_submit_transfer(usb_backend_pipe_req_t *pipe)
         ESP_LOGD(TAG, "submit failed: %s (ep=0x%02x)",
                  esp_err_to_name(err), pipe->endpoint_addr);
         usb_host_transfer_free(transfer);
-        return (err == ESP_ERR_INVALID_STATE) ? -ENODEV : -EIO;
+        if (err != ESP_ERR_INVALID_STATE) {
+            return -EIO;
+        }
+        /* A data pipe refuses URBs while it is halted (Linux answers
+           -EPIPE); the default pipe only does when the device is gone. */
+        return pipe->is_control ? -ENODEV : -EPIPE;
     }
 
     pipe->xfer = transfer;
@@ -925,6 +1088,8 @@ static void usb_backend_task(void *arg)
             /* If the transfer has completed (callback fired) or we've
                aborted it, finalise and signal the waiting caller. */
             if (pipe->completed || pipe->aborted) {
+                const usb_transfer_status_t usb_status =
+                    pipe->completed ? pipe->xfer->status : USB_TRANSFER_STATUS_TIMED_OUT;
                 int status = complete_transfer(pipe);
 
                 /* If we forced the abort, override the hardware status
@@ -933,6 +1098,17 @@ static void usb_backend_task(void *arg)
                     status = (pipe->cancel != NULL && *pipe->cancel)
                                  ? -ECONNRESET
                                  : -ETIMEDOUT;
+                } else if (pipe->is_control) {
+                    if (status == 0) {
+                        apply_standard_request_to_host(pipe);
+                    }
+                } else if (status != 0 && pipe->dev_hdl != NULL) {
+                    note_transfer_failure(pipe, usb_status);
+                    /* URBs queued behind a STALL are flushed by the host
+                       library; they failed because the endpoint halted. */
+                    if (usb_status == USB_TRANSFER_STATUS_CANCELED && endpoint_is_halted(pipe)) {
+                        status = -EPIPE;
+                    }
                 }
 
                 pipe->active = false;
