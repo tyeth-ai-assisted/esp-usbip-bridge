@@ -213,17 +213,27 @@ Virtual devices are on bus 2.
 |---|---|---|
 | GET | `/api/usb/devices` | VID/PID, manufacturer/product/serial strings, speed, MaxPower, interfaces, hub/port and port power state |
 | GET | `/api/usb/devices/{busid}` | one device, 404 when absent (presence check) |
-| GET | `/api/usb/hubs` | hubs with power switching mode (`per-port`, `ganged`, `none`) and every port's state |
+| GET | `/api/usb/hubs` | hubs with their decoded `wHubCharacteristics` (power switching `per-port`/`ganged`/`none`, over-current mode, compound, TT think time, port indicators, PwrOn2PwrGood, controller current) and every port's state, saved state and mismatch |
 | GET | `/api/ports`, `/api/ports/{port}` | flat port list (also at `/ports`) |
 | POST | `/api/ports/{port}/on`, `/off` | SetPortFeature/ClearPortFeature PORT_POWER, body `{"force":bool}` |
 | POST | `/api/ports/{port}/cycle` | off, wait `off_ms` (default 1000), on; runs in the background |
 | POST | `/api/ports/off`, `/api/ports/on` | every per-port switched port that does not lead to a hub |
+| POST | `/api/ports/restore` | switch every port whose power differs from its saved state back to it |
+| GET/POST | `/api/settings` | `{"enforce_per_port_switching": bool, "restore_port_power": bool}` |
 | POST | `/api/usb/debug` | log the USB host's hub, port and enumeration state to the console |
 
 Port power is refused (409) unless `force` is set when the hub does not report
 per-port power switching (ganged hubs switch all ports or none, and many cheap
-hubs have no switches at all), and when powering off a port that leads to
-another hub. A port that was switched off stays off until switched on again.
+hubs have no switches at all) while `enforce_per_port_switching` is on (the
+default), and when powering off a port that leads to another hub.
+
+The last power state set for each port path is saved in NVS. With
+`restore_port_power` on (the default), a port that was switched off stays off
+when its hub re-enumerates: hub reset, upstream power loss or bridge reboot.
+The USB host library keeps such ports unpowered from the start, so the DUT never
+sees VBUS. With it off, ports come back powered and show `mismatch` until
+`POST /api/ports/restore`. Both settings are toggles on the web page's
+Hubs & Power tab.
 
 ### I2C strand mux
 
@@ -253,7 +263,8 @@ The web page has a token field.
 JSON responses) with tools `list_usb_devices`, `get_usb_device`, `list_hubs`,
 `set_port_power`, `power_cycle_port`, `set_device_name`, `mux_status`,
 `mux_select`, `mux_isolate`, `mux_set_channel`, `mux_get_topology`,
-`mux_set_topology` and `get_bridge_info`. For example with Claude Code:
+`mux_set_topology`, `get_port_power_settings`, `set_port_power_settings`,
+`restore_port_power` and `get_bridge_info`. For example with Claude Code:
 
 ```bash
 claude mcp add --transport http usbip-bridge http://usbip-xxxxxx.local/mcp

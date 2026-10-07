@@ -434,22 +434,57 @@ function loadDevs() {
   });
 }
 
+function showSettings(s) {
+  if (!s) return;
+  var e = document.getElementById('setEnf'), r = document.getElementById('setRst');
+  if (e && document.activeElement !== e) e.checked = !!s.enforce_per_port_switching;
+  if (r && document.activeElement !== r) r.checked = !!s.restore_port_power;
+}
+
+function saveSettings() {
+  api('POST', '/api/settings', {
+    enforce_per_port_switching: document.getElementById('setEnf').checked,
+    restore_port_power: document.getElementById('setRst').checked
+  }, function (ok, r) {
+    if (!ok) alert('Settings: ' + (r && r.error));
+    showSettings(r);
+  });
+}
+
+function restorePorts() {
+  api('POST', '/api/ports/restore', null, function (ok, r) {
+    document.getElementById('rstst').textContent = ok ? (r.ports + ' port(s) restored') : (r && r.error);
+    setTimeout(refreshUsb, 1000);
+  });
+}
+
+function hubChars(c) {
+  if (!c) return '';
+  return 'wHubCharacteristics ' + esc(c.raw) + ': power switching <strong' +
+         (c.power_switching == 'per-port' ? '' : ' class="warn"') + '>' + esc(c.power_switching) + '</strong>, ' +
+         'over-current ' + esc(c.over_current_protection) + ', ' + (c.compound ? 'compound, ' : '') +
+         'TT think ' + esc(c.tt_think_time_fs_bits) + ' FS bits, ' +
+         (c.port_indicators ? 'port indicators, ' : '') +
+         'PwrOn2PwrGood ' + esc(c.pwr_on_to_pwr_good_ms) + ' ms, controller ' + esc(c.hub_contr_current_ma) + ' mA';
+}
+
 function loadHubs() {
   api('GET', '/api/usb/hubs', null, function (ok, r) {
     var el = document.getElementById('hubs');
     if (!el || !ok) return;
+    showSettings(r.settings);
     if (!r.hubs.length) { el.innerHTML = 'No hubs attached'; return; }
     var h = '';
     r.hubs.forEach(function (hub) {
       h += '<div class="hub"><strong>' + esc(hub.path) + '</strong> ' + esc(hub.vid) + ':' + esc(hub.pid) +
-           ' ' + esc(hub.product) + ' &mdash; ' + esc(hub.num_ports) + ' ports, power switching <strong>' +
-           esc(hub.power_switching) + '</strong>, PwrOn2PwrGood ' + esc(hub.pwr_on_to_pwr_good_ms) + ' ms</div>';
-      h += '<table><thead><tr><th>Port</th><th>Power</th><th>Link</th><th>Speed</th><th>Attached</th><th>Action</th></tr></thead><tbody>';
+           ' ' + esc(hub.product) + ' &mdash; ' + esc(hub.num_ports) + ' ports<br>' + hubChars(hub.characteristics) + '</div>';
+      h += '<table><thead><tr><th>Port</th><th>Power</th><th>Saved</th><th>Link</th><th>Speed</th><th>Attached</th><th>Action</th></tr></thead><tbody>';
       hub.ports.forEach(function (p) {
         var dev = p.device ? (esc(p.device.type) + ' ' + esc(p.device.vid) + ':' + esc(p.device.pid)) : '';
         h += '<tr><td>' + esc(p.path) + '</td>' +
              '<td class="' + (p.power == 'on' ? 'hi' : 'lo') + '">' + esc(p.power) + (p.user_off ? ' (switched off)' : '') +
              (p.over_current ? ' <span class="lo">OVER-CURRENT</span>' : '') + '</td>' +
+             '<td>' + esc(p.desired) + (p.mismatch ? ' <span class="warn">mismatch</span>' : '') + '</td>' +
              '<td>' + (p.connected ? 'connected' : '<span class="muted">-</span>') + '</td>' +
              '<td>' + esc(p.speed) + '</td><td>' + dev + '</td>' +
              '<td>' + powerButtons(p.path) + '</td></tr>';

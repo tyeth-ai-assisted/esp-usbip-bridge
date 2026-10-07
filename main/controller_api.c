@@ -342,6 +342,8 @@ static api_result_t core_info(void)
     return result(200, j);
 }
 
+static cJSON *settings_json(void);
+
 static hub_ctl_hub_status_t *snapshot_hubs(size_t *n)
 {
     hub_ctl_hub_status_t *snap = malloc(USB_BACKEND_MAX_HUBS * sizeof(*snap));
@@ -491,6 +493,8 @@ static cJSON *port_json(const hub_ctl_port_t *p)
     cJSON_AddBoolToObject(o, "suspended", p->suspended);
     cJSON_AddBoolToObject(o, "over_current", p->over_current);
     cJSON_AddBoolToObject(o, "user_off", p->user_off);
+    cJSON_AddStringToObject(o, "desired", p->desired_on ? "on" : "off");
+    cJSON_AddBoolToObject(o, "mismatch", p->mismatch);
     add_str_or_null(o, "speed", p->speed);
     if (p->has_device || p->has_hub) {
         cJSON *d = cJSON_AddObjectToObject(o, "device");
@@ -512,6 +516,7 @@ static api_result_t core_hubs(void)
         return fail(503, "out of memory");
     }
     cJSON *j = cJSON_CreateObject();
+    cJSON_AddItemToObject(j, "settings", settings_json());
     cJSON *arr = cJSON_AddArrayToObject(j, "hubs");
     for (size_t h = 0; h < n; h++) {
         const hub_ctl_hub_status_t *s = &snap[h];
@@ -528,6 +533,18 @@ static api_result_t core_hubs(void)
             cJSON_AddStringToObject(o, "power_switching", hub_ctl_power_switching_name(s->info.power_switching));
             cJSON_AddNumberToObject(o, "pwr_on_to_pwr_good_ms", s->info.pwr_on_to_pwr_good_ms);
             cJSON_AddBoolToObject(o, "compound", s->info.compound);
+            cJSON *c = cJSON_AddObjectToObject(o, "characteristics");
+            char raw[8];
+            snprintf(raw, sizeof(raw), "0x%04x", s->info.characteristics);
+            cJSON_AddStringToObject(c, "raw", raw);
+            cJSON_AddStringToObject(c, "power_switching", hub_ctl_power_switching_name(s->info.power_switching));
+            cJSON_AddStringToObject(c, "over_current_protection",
+                                    hub_ctl_over_current_name(s->info.over_current_protection));
+            cJSON_AddBoolToObject(c, "compound", s->info.compound);
+            cJSON_AddNumberToObject(c, "tt_think_time_fs_bits", 8 * (s->info.tt_think_time + 1));
+            cJSON_AddBoolToObject(c, "port_indicators", s->info.port_indicators);
+            cJSON_AddNumberToObject(c, "pwr_on_to_pwr_good_ms", s->info.pwr_on_to_pwr_good_ms);
+            cJSON_AddNumberToObject(c, "hub_contr_current_ma", s->info.hub_contr_current_ma);
         }
         cJSON *ports = cJSON_AddArrayToObject(o, "ports");
         for (uint8_t p = 0; p < s->num_ports; p++) {
@@ -625,6 +642,53 @@ static api_result_t core_ports_all(bool on)
     cJSON *j = cJSON_CreateObject();
     cJSON_AddBoolToObject(j, "ok", true);
     cJSON_AddStringToObject(j, "action", on ? "all_on" : "all_off");
+    cJSON_AddNumberToObject(j, "ports", n);
+    return result(200, j);
+}
+
+static cJSON *settings_json(void)
+{
+    hub_ctl_settings_t st;
+    hub_ctl_get_settings(&st);
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "enforce_per_port_switching", st.enforce_per_port);
+    cJSON_AddBoolToObject(j, "restore_port_power", st.restore_on_reset);
+    return j;
+}
+
+static api_result_t core_get_settings(void)
+{
+    return result(200, settings_json());
+}
+
+/* Update the settings present in `args` (others unchanged) */
+static api_result_t core_set_settings(const cJSON *args)
+{
+    if (!cJSON_IsObject(args)) {
+        return fail(400, "expected {\"enforce_per_port_switching\": bool, \"restore_port_power\": bool}");
+    }
+    hub_ctl_settings_t st;
+    hub_ctl_get_settings(&st);
+    st.enforce_per_port = json_bool(args, "enforce_per_port_switching", st.enforce_per_port);
+    st.restore_on_reset = json_bool(args, "restore_port_power", st.restore_on_reset);
+    esp_err_t err = hub_ctl_set_settings(&st);
+    if (err != ESP_OK) {
+        return fail(500, esp_err_to_name(err));
+    }
+    cJSON *j = settings_json();
+    cJSON_AddBoolToObject(j, "ok", true);
+    return result(200, j);
+}
+
+static api_result_t core_restore(void)
+{
+    int n = hub_ctl_restore_now();
+    if (n < 0) {
+        return fail(503, "out of memory");
+    }
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "ok", true);
+    cJSON_AddStringToObject(j, "action", "restore");
     cJSON_AddNumberToObject(j, "ports", n);
     return result(200, j);
 }
@@ -804,9 +868,12 @@ static const api_route_doc_t k_routes[] = {
     { "GET",  "/api/ports",                         false, "Every downstream hub port (alias /ports)", NULL },
     { "GET",  "/api/ports/{port}",                  false, "One port, e.g. 1-1.3", NULL },
     { "POST", "/api/ports/{port}/on",               true,  "Power a hub port on (SetPortFeature PORT_POWER)", "{\"force\":bool}" },
-    { "POST", "/api/ports/{port}/off",              true,  "Power a hub port off. Refused for ganged/non-switching hubs and ports leading to hubs unless force", "{\"force\":bool}" },
+    { "POST", "/api/ports/{port}/off",              true,  "Power a hub port off. Refused for ganged/non-switching hubs (while enforced) and ports leading to hubs unless force. The state is saved per port path", "{\"force\":bool}" },
     { "POST", "/api/ports/{port}/cycle",            true,  "Power off, wait off_ms (default 1000), power on; runs in the background", "{\"off_ms\":int,\"force\":bool}" },
     { "POST", "/api/ports/off",                     true,  "Power off every per-port switched port that does not lead to a hub", NULL },
+    { "POST", "/api/ports/restore",                 true,  "Apply the saved power state to every port whose power does not match it", NULL },
+    { "GET",  "/api/settings",                      false, "Port power settings", NULL },
+    { "POST", "/api/settings",                      true,  "enforce_per_port_switching: refuse ganged/non-switching hubs unless forced; restore_port_power: keep ports switched off when their hub re-enumerates", "{\"enforce_per_port_switching\":bool,\"restore_port_power\":bool}" },
     { "POST", "/api/ports/on",                      true,  "Power on every per-port switched port", NULL },
     { "GET",  "/api/status",                        false, "Analog mux state {active, manual, duts, groups}", NULL },
     { "GET",  "/api/duts",                          false, "Analog mux DUTs {active, duts}", NULL },
@@ -880,6 +947,16 @@ static const mcp_tool_t k_tools[] = {
       "list_usb_devices to see the device come back).",
       "{\"type\":\"object\",\"properties\":{\"port\":{\"type\":\"string\"},\"off_ms\":{\"type\":\"integer\",\"default\":1000},"
       "\"force\":{\"type\":\"boolean\",\"default\":false}},\"required\":[\"port\"]}" },
+    { "get_port_power_settings",
+      "Port power settings: enforce_per_port_switching (refuse hubs without per-port power switching "
+      "unless forced) and restore_port_power (keep ports that were switched off powered off when their "
+      "hub re-enumerates after a reset, power loss or bridge reboot).", NO_ARGS },
+    { "set_port_power_settings", "Change the port power settings (omitted fields are unchanged).",
+      "{\"type\":\"object\",\"properties\":{\"enforce_per_port_switching\":{\"type\":\"boolean\"},"
+      "\"restore_port_power\":{\"type\":\"boolean\"}}}" },
+    { "restore_port_power",
+      "Apply the saved power state to every hub port whose actual power does not match it (list_hubs "
+      "shows desired and mismatch per port).", NO_ARGS },
     { "set_device_name", "Give the device on a port a friendly name (stored per port path).",
       "{\"type\":\"object\",\"properties\":{\"busid\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"busid\",\"name\"]}" },
     { "mux_status",
@@ -947,6 +1024,15 @@ static api_result_t mcp_call_tool(const char *name, const cJSON *args)
         json_int(args, "off_ms", &off_ms);
         return port ? core_port_cycle(port, off_ms, json_bool(args, "force", false))
                     : fail(400, "port is required");
+    }
+    if (strcmp(name, "get_port_power_settings") == 0) {
+        return core_get_settings();
+    }
+    if (strcmp(name, "set_port_power_settings") == 0) {
+        return core_set_settings(args);
+    }
+    if (strcmp(name, "restore_port_power") == 0) {
+        return core_restore();
     }
     if (strcmp(name, "set_device_name") == 0) {
         return core_set_device_name(json_string(args, "busid"), json_string(args, "name"));
@@ -1155,6 +1241,7 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
                        strncmp(path, "/api/select", 11) == 0 || path_is(path, "/api/isolate") ||
                        strncmp(path, "/api/groups/", 12) == 0 || path_is(path, "/api/topology") ||
                        path_is(path, "/api/probe") || strncmp(path, "/api/auth", 9) == 0 ||
+                       path_is(path, "/api/settings") ||
                        path_is(path, "/api/reboot");
     if (!known) {
         return false;
@@ -1221,6 +1308,10 @@ bool controller_api_handle(const char *method, const char *url, const char *auth
         r = core_ports_all(false);
     } else if (path_is(path, "/api/ports/on") && is_method(method, "POST")) {
         r = core_ports_all(true);
+    } else if (path_is(path, "/api/ports/restore") && is_method(method, "POST")) {
+        r = core_restore();
+    } else if (path_is(path, "/api/settings")) {
+        r = is_method(method, "GET") ? core_get_settings() : core_set_settings(json);
     } else if (strncmp(path, "/api/ports/", 11) == 0) {
         const char *rest = take_segment(path + 11, seg, sizeof(seg));
         bool force = json_bool(json, "force", query_flag(query, "force"));

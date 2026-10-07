@@ -7,6 +7,7 @@
 
 #include "analog_mux.h"
 #include "controller_api.h"
+#include "hub_control.h"
 #include "device_naming.h"
 #include "discovery_service.h"
 #include "http_server.h"
@@ -49,6 +50,8 @@ void app_main(void)
     ESP_ERROR_CHECK(device_naming_init());
     ESP_ERROR_CHECK(controller_api_init());
     ESP_ERROR_CHECK(analog_mux_init());
+    /* Before usb_backend_start(): installs the port power restore policy */
+    ESP_ERROR_CHECK(hub_ctl_init());
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
