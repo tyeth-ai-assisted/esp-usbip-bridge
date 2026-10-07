@@ -42,6 +42,7 @@
 typedef enum {
     USB_BACKEND_EVENT_NEW_DEV = 1,
     USB_BACKEND_EVENT_DEV_GONE = 2,
+    USB_BACKEND_EVENT_RELEASE = 3,
 } usb_backend_event_type_t;
 
 typedef struct {
@@ -49,6 +50,7 @@ typedef struct {
     union {
         uint8_t address;
         usb_device_handle_t dev_hdl;
+        char busid[32];
     } u;
 } usb_backend_event_t;
 
@@ -605,6 +607,36 @@ static void remove_gone_device(usb_device_handle_t dev_hdl)
     xSemaphoreGive(s_state.state_mutex);
 }
 
+/* A client's USB/IP session for the device ended: release its interfaces,
+   which frees their host pipes and DWC channels for other devices.  The host
+   has 16 channels and every device's EP0 and each hub's interrupt endpoint
+   hold one for good, so a few devices with many endpoints claimed (CDC + MSC
+   + HID + MIDI) exhaust them and later claims fail.  The next session claims
+   the interfaces again, with fresh pipes at DATA0, on its first non-control
+   transfer.  A device with a transfer still in flight keeps its interfaces. */
+static void release_session_device(const char busid[32])
+{
+    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+    const int slot = find_slot_by_busid_locked(busid);
+    if (slot >= 0 && s_state.devices[slot].interfaces_claimed) {
+        bool busy = false;
+        for (int i = 0; i < USB_BACKEND_NUM_PIPES; i++) {
+            if (s_state.pipes[i].submitted && busid_matches_key(busid, s_state.pipes[i].busid)) {
+                busy = true;
+                break;
+            }
+        }
+        if (busy) {
+            ESP_LOGD(TAG, "%s: session ended with a transfer in flight, interfaces kept", busid);
+        } else {
+            release_interfaces_locked(slot);
+            s_state.devices[slot].halted_eps = 0;
+            ESP_LOGI(TAG, "%s: session ended, interfaces released", busid);
+        }
+    }
+    xSemaphoreGive(s_state.state_mutex);
+}
+
 static void process_backend_events(void)
 {
     usb_backend_event_t evt;
@@ -613,7 +645,23 @@ static void process_backend_events(void)
             export_new_device(evt.u.address);
         } else if (evt.type == USB_BACKEND_EVENT_DEV_GONE) {
             remove_gone_device(evt.u.dev_hdl);
+        } else if (evt.type == USB_BACKEND_EVENT_RELEASE) {
+            release_session_device(evt.u.busid);
         }
+    }
+}
+
+void usb_backend_session_ended(const char busid[32])
+{
+    if (busid == NULL || s_state.event_queue == NULL) {
+        return;
+    }
+    usb_backend_event_t evt = {
+        .type = USB_BACKEND_EVENT_RELEASE,
+    };
+    strlcpy(evt.u.busid, busid, sizeof(evt.u.busid));
+    if (xQueueSend(s_state.event_queue, &evt, 0) == pdTRUE) {
+        xTaskNotifyGive(s_state.task_hdl);
     }
 }
 

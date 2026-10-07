@@ -98,6 +98,10 @@ int usb_backend_interrupt_transfer(const char busid[32],
                                    volatile bool *cancel);
 bool usb_backend_is_interrupt_endpoint(const char busid[32], uint8_t ep_num, uint8_t direction);
 
+/* The client's USB/IP session for a device has ended: release its claimed
+   interfaces (and their host channels) until the next session uses them. */
+void usb_backend_session_ended(const char busid[32]);
+
 /* Snapshot of the external hubs currently attached. */
 size_t usb_backend_get_hubs(usb_backend_hub_t *out_hubs, size_t max_hubs);
 

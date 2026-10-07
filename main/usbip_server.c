@@ -791,6 +791,9 @@ cleanup:
         if (atomic_load(&ctx->inflight_count) == 0) break;
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+    /* Free the device's host channels for other sessions (a no-op for
+       virtual devices, and skipped while a transfer is still in flight). */
+    usb_backend_session_ended(imported_busid);
     if (atomic_load(&ctx->inflight_count) != 0) {
         /* A worker is still inside the backend and will touch ctx when it
            finishes; leak ctx rather than free it under the worker. */
