@@ -48,13 +48,13 @@ static bool read_exact(int fd, void *buf, size_t len)
     return true;
 }
 
-static bool write_all(int fd, const void *buf, size_t len)
+static bool write_all_flags(int fd, const void *buf, size_t len, int flags)
 {
     const uint8_t *ptr = (const uint8_t *)buf;
     size_t remaining = len;
 
     while (remaining > 0) {
-        const ssize_t n = send(fd, ptr, remaining, 0);
+        const ssize_t n = send(fd, ptr, remaining, flags);
         if (n <= 0) {
             return false;
         }
@@ -63,6 +63,11 @@ static bool write_all(int fd, const void *buf, size_t len)
     }
 
     return true;
+}
+
+static bool write_all(int fd, const void *buf, size_t len)
+{
+    return write_all_flags(fd, buf, len, 0);
 }
 
 static bool discard_exact(int fd, size_t len)
@@ -196,10 +201,59 @@ static bool send_op_common(int fd, uint16_t code, uint32_t status)
     return write_all(fd, &reply, sizeof(reply));
 }
 
+/* URB data is held in segments of URB_SEG_SIZE bytes, so a large bulk URB
+   (Linux usb-storage sends up to 120 KiB) needs no large contiguous
+   allocation, which a fragmented heap often cannot provide.  A bulk URB
+   runs as one host transfer per segment; URB_SEG_SIZE is a multiple of
+   every bulk max packet size, so the packets on the bus are the same as
+   for a single transfer. */
+#define URB_SEG_SIZE \
+    ((CONFIG_USBIP_MAX_TRANSFER >= 1024) ? (CONFIG_USBIP_MAX_TRANSFER & ~1023) : CONFIG_USBIP_MAX_TRANSFER)
+#define URB_MAX_SEGS ((CONFIG_USBIP_MAX_URB_SIZE + URB_SEG_SIZE - 1) / URB_SEG_SIZE)
+
+typedef struct {
+    uint8_t *seg[URB_MAX_SEGS];
+    size_t len;
+} urb_buf_t;
+
+static size_t urb_buf_nsegs(const urb_buf_t *buf)
+{
+    return (buf->len + URB_SEG_SIZE - 1) / URB_SEG_SIZE;
+}
+
+static size_t urb_buf_seg_len(const urb_buf_t *buf, size_t i)
+{
+    const size_t rest = buf->len - i * URB_SEG_SIZE;
+    return (rest < URB_SEG_SIZE) ? rest : URB_SEG_SIZE;
+}
+
+static void urb_buf_free(urb_buf_t *buf)
+{
+    for (size_t i = 0; i < URB_MAX_SEGS; i++) {
+        free(buf->seg[i]);
+        buf->seg[i] = NULL;
+    }
+    buf->len = 0;
+}
+
+static bool urb_buf_alloc(urb_buf_t *buf, size_t len)
+{
+    memset(buf, 0, sizeof(*buf));
+    buf->len = len;
+    for (size_t i = 0; i < urb_buf_nsegs(buf); i++) {
+        buf->seg[i] = malloc(urb_buf_seg_len(buf, i));
+        if (buf->seg[i] == NULL) {
+            urb_buf_free(buf);
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool send_ret_submit(int fd,
                             const usbip_header_t *request,
                             int32_t status,
-                            const uint8_t *payload,
+                            const urb_buf_t *payload,
                             uint32_t payload_len)
 {
     usbip_header_t reply;
@@ -218,21 +272,29 @@ static bool send_ret_submit(int fd,
     reply.u.ret_submit.error_count = htonl(0);
     reply.u.ret_submit.padding = 0;
 
-    /* Send header and payload in a single TCP segment so the kernel
-       can read both without waiting for a second segment. */
-    if (payload_len > 0 && payload != NULL) {
-        uint8_t *buf = malloc(sizeof(reply) + payload_len);
-        if (buf == NULL) {
-            return false;
-        }
-        memcpy(buf, &reply, sizeof(reply));
-        memcpy(buf + sizeof(reply), payload, payload_len);
-        bool ok = write_all(fd, buf, sizeof(reply) + payload_len);
-        free(buf);
-        return ok;
+    if (payload_len == 0 || payload == NULL) {
+        return write_all(fd, &reply, sizeof(reply));
     }
 
-    return write_all(fd, &reply, sizeof(reply));
+    /* MSG_MORE lets the stack send the header in the same TCP segment as
+       the start of the payload, so the client reads both without waiting
+       for a second segment.  The payload is written from its segments
+       rather than copied next to the header. */
+    if (!write_all_flags(fd, &reply, sizeof(reply), MSG_MORE)) {
+        return false;
+    }
+    size_t left = payload_len;
+    for (size_t i = 0; i < urb_buf_nsegs(payload) && left > 0; i++) {
+        size_t n = urb_buf_seg_len(payload, i);
+        if (n > left) {
+            n = left;
+        }
+        left -= n;
+        if (!write_all_flags(fd, payload->seg[i], n, left > 0 ? MSG_MORE : 0)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* RET_SUBMIT for an OUT URB: actual_length without a payload. */
@@ -302,9 +364,11 @@ typedef struct urb_work_item {
     volatile bool cancel;
     bool unlinked;                          /* CMD_UNLINK accepted for this URB */
     usbip_header_t unlink_request;          /* the CMD_UNLINK, to answer on completion */
-    uint8_t *out_data;
+    urb_buf_t out;                          /* OUT payload */
+    urb_buf_t in;                           /* IN buffer */
+    uint8_t *out_data;                      /* out.seg[0], for single-segment URBs */
     size_t out_len;
-    uint8_t *in_data;
+    uint8_t *in_data;                       /* in.seg[0], for single-segment URBs */
     size_t in_capacity;
     int slot;                               /* index in stream->in_flight[] */
 } urb_work_item_t;
@@ -384,6 +448,39 @@ static bool stream_handle_unlink(urb_stream_ctx_t *ctx, const usbip_header_t *re
     return ok;
 }
 
+/* A bulk URB larger than one segment: one host transfer per segment, in
+   order on the same endpoint.  A short IN segment ends the URB, as a short
+   packet would. */
+static int bulk_transfer_segments(urb_work_item_t *item, uint8_t ep_addr, size_t *in_len)
+{
+    const bool is_in = (ep_addr & 0x80) != 0;
+    urb_buf_t *buf = is_in ? &item->in : &item->out;
+    size_t done = 0;
+    int status = 0;
+
+    for (size_t i = 0; i < urb_buf_nsegs(buf); i++) {
+        if (item->cancel) {
+            status = -ECONNRESET;
+            break;
+        }
+        const size_t n = urb_buf_seg_len(buf, i);
+        size_t got = 0;
+        status = usb_backend_bulk_transfer(item->imported_busid, ep_addr,
+                                           is_in ? NULL : buf->seg[i], is_in ? 0 : n,
+                                           is_in ? buf->seg[i] : NULL, is_in ? n : 0,
+                                           &got, &item->cancel);
+        if (status != 0) {
+            break;
+        }
+        done += is_in ? got : n;
+        if (is_in && got < n) {
+            break;
+        }
+    }
+    *in_len = (is_in && status == 0) ? done : 0;
+    return status;
+}
+
 /* Does the blocking USB transfer, sends the response, and frees everything. */
 static void urb_process(urb_work_item_t *item)
 {
@@ -392,11 +489,20 @@ static void urb_process(urb_work_item_t *item)
     const uint32_t endpoint = ntohl(item->request.base.ep);
     size_t in_len = 0;
     int status;
+    const bool segmented = item->out.len > URB_SEG_SIZE || item->in.len > URB_SEG_SIZE;
 
     /* Check if this is a virtual device. */
     virtual_device_t *vdev = virtual_device_find_by_busid(item->imported_busid);
 
-    if (vdev != NULL) {
+    if (segmented && (vdev != NULL || endpoint == 0
+                      || usb_backend_is_interrupt_endpoint(item->imported_busid, endpoint,
+                                                           direction == USBIP_DIR_IN))) {
+        /* Only bulk URBs can be split into several transfers. */
+        status = -EMSGSIZE;
+    } else if (segmented) {
+        status = bulk_transfer_segments(item, (uint8_t)(endpoint |
+            (direction == USBIP_DIR_IN ? 0x80 : 0x00)), &in_len);
+    } else if (vdev != NULL) {
         if (endpoint == 0) {
             usb_setup_packet_t setup;
             memcpy(&setup, item->request.u.cmd_submit.setup, sizeof(setup));
@@ -452,7 +558,7 @@ static void urb_process(urb_work_item_t *item)
         send_ret_unlink(ctx->fd, &item->unlink_request, -ECONNRESET);
     } else if (direction == USBIP_DIR_IN) {
         send_ret_submit(ctx->fd, &item->request, status,
-                        status == 0 ? item->in_data : NULL,
+                        status == 0 ? &item->in : NULL,
                         status == 0 ? (uint32_t)in_len : 0);
     } else {
         /* OUT: actual_length is the number of bytes sent, with no payload.
@@ -464,8 +570,8 @@ static void urb_process(urb_work_item_t *item)
     urb_stream_free_slot(ctx, item->slot);
     xSemaphoreGive(ctx->write_mutex);
 
-    free(item->out_data);
-    free(item->in_data);
+    urb_buf_free(&item->out);
+    urb_buf_free(&item->in);
     free(item);
 }
 
@@ -539,7 +645,7 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
                 goto cleanup;
             continue;
         }
-        if (req_len > CONFIG_USBIP_MAX_TRANSFER) {
+        if (req_len > CONFIG_USBIP_MAX_URB_SIZE) {
             ESP_LOGD(TAG, "  -> EMSGSIZE");
             if (direction == USBIP_DIR_OUT && req_len > 0) {
                 if (!discard_exact(fd, (size_t)req_len)) goto cleanup;
@@ -579,42 +685,44 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
             }
         }
 
+        /* Build the work item; it holds the URB's data segments. */
+        urb_work_item_t *item = calloc(1, sizeof(urb_work_item_t));
+        if (item == NULL) {
+            if (direction == USBIP_DIR_OUT && req_len > 0) {
+                if (!discard_exact(fd, (size_t)req_len)) goto cleanup;
+            }
+            if (!stream_send_ret_submit(ctx, &request, -ENOMEM))
+                goto cleanup;
+            continue;
+        }
+
         /* Read OUT data payload (follows the header in the TCP stream). */
-        uint8_t *out_data = NULL;
-        size_t out_len = (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0;
+        const size_t out_len = (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0;
         if (out_len > 0) {
-            out_data = malloc(out_len);
-            if (out_data == NULL) {
+            if (!urb_buf_alloc(&item->out, out_len)) {
+                free(item);
                 if (!discard_exact(fd, out_len)) goto cleanup;
                 if (!stream_send_ret_submit(ctx, &request, -ENOMEM))
                     goto cleanup;
                 continue;
             }
-            if (!read_exact(fd, out_data, out_len)) {
-                free(out_data);
+            bool read_ok = true;
+            for (size_t i = 0; i < urb_buf_nsegs(&item->out) && read_ok; i++) {
+                read_ok = read_exact(fd, item->out.seg[i], urb_buf_seg_len(&item->out, i));
+            }
+            if (!read_ok) {
+                urb_buf_free(&item->out);
+                free(item);
                 goto cleanup;
             }
         }
 
         /* Allocate IN buffer. */
-        uint8_t *in_data = NULL;
-        size_t in_capacity =
+        const size_t in_capacity =
             (direction == USBIP_DIR_IN) ? (size_t)req_len : 0;
-        if (in_capacity > 0) {
-            in_data = malloc(in_capacity);
-            if (in_data == NULL) {
-                free(out_data);
-                if (!stream_send_ret_submit(ctx, &request, -ENOMEM))
-                    goto cleanup;
-                continue;
-            }
-        }
-
-        /* Build work item and spawn worker. */
-        urb_work_item_t *item = calloc(1, sizeof(urb_work_item_t));
-        if (item == NULL) {
-            free(out_data);
-            free(in_data);
+        if (in_capacity > 0 && !urb_buf_alloc(&item->in, in_capacity)) {
+            urb_buf_free(&item->out);
+            free(item);
             if (!stream_send_ret_submit(ctx, &request, -ENOMEM))
                 goto cleanup;
             continue;
@@ -625,9 +733,9 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
         memcpy(item->imported_busid, imported_busid, sizeof(item->imported_busid));
         item->expected_devid = expected_devid;
         item->cancel = false;
-        item->out_data = out_data;
+        item->out_data = item->out.seg[0];
         item->out_len = out_len;
-        item->in_data = in_data;
+        item->in_data = item->in.seg[0];
         item->in_capacity = in_capacity;
 
         item->slot = urb_stream_alloc_slot(ctx, seqnum, item);
@@ -639,8 +747,8 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
                 vTaskDelay(pdMS_TO_TICKS(50));
                 item->slot = urb_stream_alloc_slot(ctx, seqnum, item);
                 if (ctx->cancel) {
-                    free(out_data);
-                    free(in_data);
+                    urb_buf_free(&item->out);
+                    urb_buf_free(&item->in);
                     free(item);
                     goto cleanup;
                 }
@@ -658,8 +766,8 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
                 xSemaphoreTake(ctx->write_mutex, portMAX_DELAY);
                 urb_stream_free_slot(ctx, item->slot);
                 xSemaphoreGive(ctx->write_mutex);
-                free(out_data);
-                free(in_data);
+                urb_buf_free(&item->out);
+                urb_buf_free(&item->in);
                 free(item);
                 if (!stream_send_ret_submit(ctx, &request, -ENOMEM))
                     goto cleanup;
