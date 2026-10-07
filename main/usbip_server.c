@@ -206,14 +206,19 @@ static bool send_ret_unlink(int fd, const usbip_header_t *request, int32_t statu
 /* Maximum concurrent in-flight URBs per TCP connection. */
 #define URB_STREAM_MAX_INFLIGHT 8
 
-/* Per-connection context shared between the reader loop and worker tasks. */
+struct urb_work_item;
+
+/* Per-connection context shared between the reader loop and worker tasks.
+   write_mutex guards both socket writes and in_flight[]: a worker sends its
+   reply and frees its slot under the lock, so CMD_UNLINK either finds the
+   URB still pending or knows its RET_SUBMIT has already gone out. */
 typedef struct {
     int fd;
     volatile bool cancel;                   /* set when client disconnects */
     SemaphoreHandle_t write_mutex;          /* serialises socket writes */
     atomic_int inflight_count;              /* active worker tasks */
     struct {
-        volatile bool *cancel_ptr;          /* pointer to per-URB cancel flag */
+        struct urb_work_item *item;         /* NULL = slot free */
         uint32_t seqnum;
     } in_flight[URB_STREAM_MAX_INFLIGHT];
 } urb_stream_ctx_t;
@@ -221,12 +226,14 @@ typedef struct {
 /* Work item handed to a worker task.  The worker does the blocking
    backend call, sends the response (under write_mutex), and frees
    all associated memory. */
-typedef struct {
+typedef struct urb_work_item {
     urb_stream_ctx_t *stream;
     usbip_header_t request;
     char imported_busid[32];
     uint32_t expected_devid;
     volatile bool cancel;
+    bool unlinked;                          /* CMD_UNLINK accepted for this URB */
+    usbip_header_t unlink_request;          /* the CMD_UNLINK, to answer on completion */
     uint8_t *out_data;
     size_t out_len;
     uint8_t *in_data;
@@ -234,39 +241,79 @@ typedef struct {
     int slot;                               /* index in stream->in_flight[] */
 } urb_work_item_t;
 
-/* Free an in-flight slot so it can be reused. */
+/* Free an in-flight slot so it can be reused.  Caller holds write_mutex. */
 static void urb_stream_free_slot(urb_stream_ctx_t *ctx, int slot)
 {
-    ctx->in_flight[slot].cancel_ptr = NULL;
+    ctx->in_flight[slot].item = NULL;
     ctx->in_flight[slot].seqnum = 0;
     atomic_fetch_sub(&ctx->inflight_count, 1);
 }
 
-/* Allocate an in-flight slot, link the cancel pointer, return index. */
+/* Allocate an in-flight slot for item, return its index or -1 when full. */
 static int urb_stream_alloc_slot(urb_stream_ctx_t *ctx, uint32_t seqnum,
-                                  volatile bool *cancel_ptr)
+                                  urb_work_item_t *item)
 {
+    int slot = -1;
+    xSemaphoreTake(ctx->write_mutex, portMAX_DELAY);
     for (int i = 0; i < URB_STREAM_MAX_INFLIGHT; i++) {
-        if (ctx->in_flight[i].cancel_ptr == NULL) {
-            ctx->in_flight[i].cancel_ptr = cancel_ptr;
+        if (ctx->in_flight[i].item == NULL) {
+            ctx->in_flight[i].item = item;
             ctx->in_flight[i].seqnum = seqnum;
             atomic_fetch_add(&ctx->inflight_count, 1);
-            return i;
+            slot = i;
+            break;
         }
     }
-    return -1;
+    xSemaphoreGive(ctx->write_mutex);
+    return slot;
 }
 
-/* Find an in-flight slot by seqnum (for CMD_UNLINK). */
+/* Find an in-flight slot by seqnum (for CMD_UNLINK).  Caller holds write_mutex. */
 static int urb_stream_find_by_seqnum(urb_stream_ctx_t *ctx, uint32_t seqnum)
 {
     for (int i = 0; i < URB_STREAM_MAX_INFLIGHT; i++) {
-        if (ctx->in_flight[i].cancel_ptr != NULL
+        if (ctx->in_flight[i].item != NULL
             && ctx->in_flight[i].seqnum == seqnum) {
             return i;
         }
     }
     return -1;
+}
+
+/* RET_SUBMIT from the reader loop, serialised against the workers. */
+static bool stream_send_ret_submit(urb_stream_ctx_t *ctx,
+                                   const usbip_header_t *request, int32_t status)
+{
+    xSemaphoreTake(ctx->write_mutex, portMAX_DELAY);
+    bool ok = send_ret_submit(ctx->fd, request, status, NULL, 0);
+    xSemaphoreGive(ctx->write_mutex);
+    return ok;
+}
+
+/* CMD_UNLINK, with Linux usbip-host semantics: if the URB is still pending,
+   cancel it and answer RET_UNLINK(-ECONNRESET) *instead of* its RET_SUBMIT
+   when it completes; if it has already completed (RET_SUBMIT sent), answer
+   RET_UNLINK(0) now.  vhci_hcd drops the connection if a RET_SUBMIT arrives
+   for a URB it has already given back. */
+static bool stream_handle_unlink(urb_stream_ctx_t *ctx, const usbip_header_t *request)
+{
+    const uint32_t unlink_seq = ntohl(request->u.cmd_unlink.unlink_seqnum);
+    bool ok = true;
+
+    xSemaphoreTake(ctx->write_mutex, portMAX_DELAY);
+    int slot = urb_stream_find_by_seqnum(ctx, unlink_seq);
+    if (slot >= 0 && !ctx->in_flight[slot].item->unlinked) {
+        urb_work_item_t *item = ctx->in_flight[slot].item;
+        item->unlink_request = *request;
+        item->unlinked = true;
+        item->cancel = true;
+        ESP_LOGD(TAG, "CMD_UNLINK seq=%"PRIu32": cancelling", unlink_seq);
+    } else {
+        ok = send_ret_unlink(ctx->fd, request, 0);
+        ESP_LOGD(TAG, "CMD_UNLINK seq=%"PRIu32": already completed", unlink_seq);
+    }
+    xSemaphoreGive(ctx->write_mutex);
+    return ok;
 }
 
 /* Does the blocking USB transfer, sends the response, and frees everything. */
@@ -330,15 +377,19 @@ static void urb_process(urb_work_item_t *item)
         }
     }
 
-    /* Serialise writes to the shared TCP socket. */
+    /* Reply and release the slot under write_mutex, so a concurrent
+       CMD_UNLINK sees either a pending URB or one already answered. */
     xSemaphoreTake(ctx->write_mutex, portMAX_DELAY);
-    send_ret_submit(ctx->fd, &item->request, status,
-                    (status == 0 && direction == USBIP_DIR_IN) ? item->in_data : NULL,
-                    (status == 0 && direction == USBIP_DIR_IN) ? (uint32_t)in_len : 0);
+    if (item->unlinked) {
+        send_ret_unlink(ctx->fd, &item->unlink_request, -ECONNRESET);
+    } else {
+        send_ret_submit(ctx->fd, &item->request, status,
+                        (status == 0 && direction == USBIP_DIR_IN) ? item->in_data : NULL,
+                        (status == 0 && direction == USBIP_DIR_IN) ? (uint32_t)in_len : 0);
+    }
+    urb_stream_free_slot(ctx, item->slot);
     xSemaphoreGive(ctx->write_mutex);
 
-    /* Release the slot and free everything. */
-    urb_stream_free_slot(ctx, item->slot);
     free(item->out_data);
     free(item->in_data);
     free(item);
@@ -383,14 +434,7 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
         const uint32_t command = ntohl(request.base.command);
 
         if (command == USBIP_CMD_UNLINK) {
-            const uint32_t unlink_seq = ntohl(request.u.cmd_unlink.unlink_seqnum);
-            ESP_LOGD(TAG, "CMD_UNLINK seq=%"PRIu32, unlink_seq);
-            /* Cancel the matching in-flight URB. */
-            int slot = urb_stream_find_by_seqnum(ctx, unlink_seq);
-            if (slot >= 0 && ctx->in_flight[slot].cancel_ptr != NULL) {
-                *ctx->in_flight[slot].cancel_ptr = true;
-            }
-            if (!send_ret_unlink(fd, &request, 0)) {
+            if (!stream_handle_unlink(ctx, &request)) {
                 goto cleanup;
             }
             continue;
@@ -417,7 +461,7 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
         /* Quick validation — errors that don't need a worker. */
         if (req_len < 0) {
             ESP_LOGD(TAG, "  -> EINVAL (req_len < 0)");
-            if (!send_ret_submit(fd, &request, -EINVAL, NULL, 0))
+            if (!stream_send_ret_submit(ctx, &request, -EINVAL))
                 goto cleanup;
             continue;
         }
@@ -426,7 +470,7 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
             if (direction == USBIP_DIR_OUT && req_len > 0) {
                 if (!discard_exact(fd, (size_t)req_len)) goto cleanup;
             }
-            if (!send_ret_submit(fd, &request, -EMSGSIZE, NULL, 0))
+            if (!stream_send_ret_submit(ctx, &request, -EMSGSIZE))
                 goto cleanup;
             continue;
         }
@@ -439,13 +483,13 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
             if (direction == USBIP_DIR_OUT && req_len > 0) {
                 if (!discard_exact(fd, (size_t)req_len)) goto cleanup;
             }
-            if (!send_ret_submit(fd, &request, -ENODEV, NULL, 0))
+            if (!stream_send_ret_submit(ctx, &request, -ENODEV))
                 goto cleanup;
             continue;
         }
         if (packet_count != USBIP_NON_ISO_PACKETS && packet_count != 0) {
             ESP_LOGD(TAG, "  -> EOPNOTSUPP (iso)");
-            if (!send_ret_submit(fd, &request, -EOPNOTSUPP, NULL, 0))
+            if (!stream_send_ret_submit(ctx, &request, -EOPNOTSUPP))
                 goto cleanup;
             continue;
         }
@@ -455,7 +499,7 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
             const bool setup_in =
                 (request.u.cmd_submit.setup[0] & USB_BM_REQUEST_TYPE_DIR_IN) != 0;
             if (((direction == USBIP_DIR_IN) ? true : false) != setup_in) {
-                if (!send_ret_submit(fd, &request, -EINVAL, NULL, 0))
+                if (!stream_send_ret_submit(ctx, &request, -EINVAL))
                     goto cleanup;
                 continue;
             }
@@ -468,7 +512,7 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
             out_data = malloc(out_len);
             if (out_data == NULL) {
                 if (!discard_exact(fd, out_len)) goto cleanup;
-                if (!send_ret_submit(fd, &request, -ENOMEM, NULL, 0))
+                if (!stream_send_ret_submit(ctx, &request, -ENOMEM))
                     goto cleanup;
                 continue;
             }
@@ -486,7 +530,7 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
             in_data = malloc(in_capacity);
             if (in_data == NULL) {
                 free(out_data);
-                if (!send_ret_submit(fd, &request, -ENOMEM, NULL, 0))
+                if (!stream_send_ret_submit(ctx, &request, -ENOMEM))
                     goto cleanup;
                 continue;
             }
@@ -497,7 +541,7 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
         if (item == NULL) {
             free(out_data);
             free(in_data);
-            if (!send_ret_submit(fd, &request, -ENOMEM, NULL, 0))
+            if (!stream_send_ret_submit(ctx, &request, -ENOMEM))
                 goto cleanup;
             continue;
         }
@@ -512,15 +556,14 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
         item->in_data = in_data;
         item->in_capacity = in_capacity;
 
-        item->slot = urb_stream_alloc_slot(ctx, seqnum, &item->cancel);
+        item->slot = urb_stream_alloc_slot(ctx, seqnum, item);
         if (item->slot < 0) {
             /* Too many in-flight URBs — wait for a slot, then retry.
                This is simpler than implementing a wait queue. */
             ESP_LOGD(TAG, "  -> too many in-flight, waiting");
             while (item->slot < 0) {
                 vTaskDelay(pdMS_TO_TICKS(50));
-                item->slot = urb_stream_alloc_slot(ctx, seqnum,
-                                                    &item->cancel);
+                item->slot = urb_stream_alloc_slot(ctx, seqnum, item);
                 if (ctx->cancel) {
                     free(out_data);
                     free(in_data);
@@ -538,11 +581,13 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
             if (xTaskCreate(urb_worker_task, "urb_wrk",
                             CONFIG_USBIP_SERVER_TASK_STACK, item,
                             CONFIG_USBIP_SERVER_TASK_PRIORITY, NULL) != pdPASS) {
+                xSemaphoreTake(ctx->write_mutex, portMAX_DELAY);
                 urb_stream_free_slot(ctx, item->slot);
+                xSemaphoreGive(ctx->write_mutex);
                 free(out_data);
                 free(in_data);
                 free(item);
-                if (!send_ret_submit(fd, &request, -ENOMEM, NULL, 0))
+                if (!stream_send_ret_submit(ctx, &request, -ENOMEM))
                     goto cleanup;
             }
         }
@@ -551,15 +596,25 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
 cleanup:
     /* Signal all in-flight workers to abort, then wait for them. */
     ctx->cancel = true;
+    xSemaphoreTake(ctx->write_mutex, portMAX_DELAY);
+    ctx->fd = -1;   /* the caller closes the socket; late replies must not reach a reused fd */
     for (int i = 0; i < URB_STREAM_MAX_INFLIGHT; i++) {
-        if (ctx->in_flight[i].cancel_ptr != NULL) {
-            *ctx->in_flight[i].cancel_ptr = true;
+        if (ctx->in_flight[i].item != NULL) {
+            ctx->in_flight[i].item->cancel = true;
         }
     }
+    xSemaphoreGive(ctx->write_mutex);
     /* Give workers time to wake up and exit. */
     for (int timeout = 0; timeout < 50; timeout++) {
         if (atomic_load(&ctx->inflight_count) == 0) break;
         vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (atomic_load(&ctx->inflight_count) != 0) {
+        /* A worker is still inside the backend and will touch ctx when it
+           finishes; leak ctx rather than free it under the worker. */
+        ESP_LOGW(TAG, "URB stream: %d worker(s) still busy, leaking context",
+                 atomic_load(&ctx->inflight_count));
+        return false;
     }
     vSemaphoreDelete(ctx->write_mutex);
     free(ctx);
