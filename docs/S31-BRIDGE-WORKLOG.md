@@ -209,3 +209,36 @@ Every issue carries a provenance label: `upstream-inherited`, `from-our-changes`
 - **esp-usbip-bridge:** #1–#12. #12 is the HTTP stall.
 - **esp-usb:** #1–#8. #8 is the enumeration timeout; #7 is the API follow-ups (busy hub done; log level open).
 - **esp-harness:** #1–#2.
+
+## 10. 2026-10-07 evening: USB/IP client fixes (WSL2 `vhci_hcd`, mass storage)
+
+Tested from a WSL2 Ubuntu 24.04 (kernel 6.6) usbip client with `usb-storage` left bound. Final image `ef312b8`; esp-usb pinned to `afe9c46`.
+
+| Issue | Commit | What |
+|---|---|---|
+| esp-usb #9 | `f99f008` | `usb_host_endpoint_reset_toggle()`: DATA0 on a halted non-control pipe (`usb_dwc_hal_chan_set_pid`) |
+| esp-usb #10 | `f03bba3` | A port that reconnects before it is recycled is reset and enumerated instead of left idle |
+| esp-usb #11 | `afe9c46` | No second hub request while one is in flight (enum retry ran outside the hub cycle, then double URB submit and `abort()`) |
+| bridge #14 | `18c2355` | `to_linux_errno()`: ETIMEDOUT 110, EMSGSIZE 90, ESHUTDOWN 108, ... |
+| bridge #13 | `8035926` | CLEAR_FEATURE(HALT) / SET_INTERFACE / SET_CONFIGURATION applied to host pipes (toggle reset); halted endpoint gives `-EPIPE` |
+| bridge #17 | `345c78a` | Aborted control transfers are no longer freed while in flight (heap corruption and reboots) |
+| bridge #18 | `84ddf83` | Bulk URBs up to 128 KiB (`CONFIG_USBIP_MAX_URB_SIZE`) held in 4 KiB segments; RET_SUBMIT has no payload copy |
+| bridge #20 | `ef312b8` | A device's interfaces are released when its USB/IP session ends (16 DWC channels) |
+
+Results:
+- RP2040 BOOTSEL: RPI-RP2 mounts; `picotool info/save/reboot` work; a 4 MiB UF2 copy flashes the board.
+- 15x 1200-baud BOOTSEL loop: no stuck port, no reboot.
+- TinyUSB mass storage (Metro S2, QT Py S3) mounts read/write.
+- `esptool` x2 on one attach works.
+- A forced timeout reaches Linux as -110.
+
+Still open:
+- bridge #19: idle bulk IN times out at 5 s, and sibling URBs are reported as `-ECONNRESET`, so cdc-acm stops reading. Needs a decision.
+- bridge #20: the channel budget with several devices attached at once.
+- `ext_hub` `abort()` on a failed hub.
+- sbc-mcu-dut-controller#6: the `1-1.1.2` DUT, probably an ESP32-S3 whose app takes over the USB PHY and crashes. Not reflashed.
+
+Bench notes:
+- The Tachyon renegotiates USB-PD (5 V/9 V) when its 5G link dips. Its whole USB hub drops (CP2102N, S31 USB-JTAG, USB LAN), so SSH over Tailscale (100.101.245.66) is the most reliable route.
+- Flash at 460800, refuse to flash while anything holds the port, and check for "Hash of data verified". A wedged CP2102N (`can't set config #1, error -32`) needs a physical replug.
+- Some CircuitPython/WipperSnapper drives have no `CIRCUITPY` label (`WIPPER`, or none). Find them by transport and filesystem type, not by label.
