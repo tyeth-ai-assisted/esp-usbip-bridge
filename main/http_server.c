@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -22,6 +23,8 @@
 #include "driver/gpio.h"
 
 #include "board_pins.h"
+#include "cJSON.h"
+#include "controller_api.h"
 #include "device_naming.h"
 #include "discovery_service.h"
 #include "usb_backend.h"
@@ -526,7 +529,35 @@ typedef struct {
     char method[16];
     char url[256];
     int  content_length;
+    char auth[160];             /* Authorization header value, "" if absent */
 } http_request_t;
+
+/* Find a header (case-insensitive name) in the request head and copy its
+   value.  Returns false if absent. */
+static bool header_value(const char *buf, size_t len, const char *name, char *out, size_t out_size)
+{
+    size_t nlen = strlen(name);
+    const char *end = buf + len;
+    const char *line = memchr(buf, '\n', len);   /* skip the request line */
+    while (line != NULL && line + 1 < end) {
+        line++;
+        if (*line == '\r' || *line == '\n') {
+            break;                                /* end of headers */
+        }
+        if ((size_t)(end - line) > nlen && strncasecmp(line, name, nlen) == 0 && line[nlen] == ':') {
+            const char *v = line + nlen + 1;
+            while (v < end && *v == ' ') v++;
+            size_t o = 0;
+            while (v < end && *v != '\r' && *v != '\n' && o + 1 < out_size) {
+                out[o++] = *v++;
+            }
+            out[o] = '\0';
+            return true;
+        }
+        line = memchr(line, '\n', end - line);
+    }
+    return false;
+}
 
 static bool parse_request(const char *buf, size_t len, http_request_t *req)
 {
@@ -534,10 +565,11 @@ static bool parse_request(const char *buf, size_t len, http_request_t *req)
     const char *eol = (const char *)memchr(buf, '\n', len);
     if (!eol) return false;
     if (sscanf(buf, "%15s %255s", req->method, req->url) < 2) return false;
-    const char *cl = strstr(buf, "Content-Length:");
-    if (cl) sscanf(cl, "Content-Length: %d", &req->content_length);
-    cl = strstr(buf, "content-length:");
-    if (cl) sscanf(cl, "content-length: %d", &req->content_length);
+    char cl[16];
+    if (header_value(buf, len, "Content-Length", cl, sizeof(cl))) {
+        req->content_length = atoi(cl);
+    }
+    header_value(buf, len, "Authorization", req->auth, sizeof(req->auth));
     return true;
 }
 
@@ -648,6 +680,35 @@ static void send_json_ok(int fd, const char *body, size_t len)
     send_all(fd, body, len, &err);
 }
 
+/* Send a controller API response with its real status code. */
+static void send_api_response(int fd, const api_response_t *r)
+{
+    int err = 0;
+    char hdr[512];
+    int n = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %u\r\n"
+        "Connection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Headers: Authorization, Content-Type, Mcp-Protocol-Version\r\n"
+        "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
+        "\r\n",
+        r->status, controller_api_status_text(r->status),
+        r->content_type ? r->content_type : k_json_ct, (unsigned)r->len);
+    send_all(fd, hdr, n, &err);
+    if (r->body && r->len) {
+        send_all(fd, r->body, r->len, &err);
+    }
+}
+
+static void http_401(int fd)
+{
+    static const char body[] = "{\"error\":\"unauthorized\"}";
+    api_response_t r = { .status = 401, .body = (char *)body, .len = sizeof(body) - 1 };
+    send_api_response(fd, &r);
+}
+
 static void http_404(int fd)
 {
     send_json_ok(fd, "{\"error\":\"Not Found\"}", 20);
@@ -739,6 +800,12 @@ static void stream_html_page(stream_t *s)
         ".sec.on{display:block}\n"
         "input.dut-wire{background:#0f3460;color:#eee;border:1px solid #555;"
         "padding:2px 4px;border-radius:3px;font-size:0.75rem;width:80px}\n"
+        "input.txt,textarea{background:#0f3460;color:#eee;border:1px solid #555;"
+        "padding:2px 6px;border-radius:3px;font-size:0.75rem}\n"
+        "textarea{width:100%%;height:160px;font-family:monospace}\n"
+        ".hub{color:#aaa;font-size:0.8rem;margin:8px 0 2px}\n"
+        ".muted{color:#888}\n"
+        "button.act{border-color:#4ade80}\n"
         "footer{text-align:center;color:#555;margin-top:20px;font-size:0.7rem}\n"
         "@media(max-width:600px){th,td{padding:3px 5px;font-size:0.7rem}}\n"
         "</style>\n"
@@ -784,9 +851,17 @@ static void stream_html_page(stream_t *s)
         "Clear Config</button>"
         " <button onclick=\"cfgImport()\" style=\"font-size:0.7rem\">Import Config</button>"
         "</p>\n"
+        "<p class=\"sub\">API token: <input id=\"tok\" class=\"txt\" type=\"password\" size=\"16\">"
+        " <button onclick=\"tokSave()\" style=\"font-size:0.7rem\">Use</button>"
+        " <button onclick=\"tokSet()\" style=\"font-size:0.7rem\">Set on bridge</button>"
+        " <span id=\"authst\" class=\"muted\"></span>"
+        " &mdash; <a href=\"/api/schema\" style=\"color:#888\">API</a>"
+        " &middot; MCP at <code>/mcp</code></p>\n"
         "<div class=\"tabs\">\n"
         "<button id=\"tp\" class=\"on\" onclick=\"st('p')\">GPIO Pins</button>\n"
         "<button id=\"tu\" onclick=\"st('u')\">USB Devices</button>\n"
+        "<button id=\"th\" onclick=\"st('h')\">Hubs &amp; Power</button>\n"
+        "<button id=\"tm\" onclick=\"st('m')\">I2C Mux</button>\n"
         "</div>\n"
         "<div id=\"sp\" class=\"sec on\">\n"
         "<h2>DUT Header Pins</h2>\n"
@@ -889,41 +964,17 @@ static void stream_html_page(stream_t *s)
         }
     }
 
-    stream_printf(s,
+    /* USB devices, hubs and the mux are rendered client-side from the
+       controller API (see web_app.js) so they stay live. */
+    stream_write(s,
         "</tbody></table></div>\n"
         "<div id=\"su\" class=\"sec\">\n"
         "<h2>USB Devices</h2>\n"
-        "<table><thead><tr><th>BusID</th><th>Vendor</th><th>Product</th>"
-        "<th>Speed</th><th>Class</th></tr></thead><tbody>\n");
-
-    /* Stream USB devices (heap-allocated to avoid ~5KB stack pressure) */
-    {
-        size_t devs_max = CONFIG_USBIP_MAX_DEVICES + VIRTUAL_DEVICE_MAX;
-        usbip_backend_device_t *devs = malloc(devs_max * sizeof(usbip_backend_device_t));
-        size_t dc = 0;
-        if (devs) {
-            dc = usb_backend_get_devices(devs, devs_max);
-            for (size_t i = 0; i < dc; i++) {
-                const char *sp = "?";
-                switch (devs[i].speed) {
-                    case 1: sp = "Low";  break;
-                    case 2: sp = "Full"; break;
-                    case 3: sp = "High"; break;
-                }
-                stream_printf(s,
-                    "<tr><td>%s</td><td>%04x</td><td>%04x</td>"
-                    "<td>%s</td><td>0x%02x</td></tr>\n",
-                    devs[i].busid, devs[i].id_vendor, devs[i].id_product,
-                    sp, devs[i].device_class);
-            }
-            free(devs);
-        }
-        if (dc == 0) {
-            stream_printf(s,
-                "<tr><td colspan=\"5\" style=\"text-align:center;color:#888\">"
-                "No USB devices</td></tr>\n");
-        }
-    }
+        "<p class=\"sub\">Attach from Linux: <code>usbip attach -r &lt;bridge&gt; -b &lt;busid&gt;</code>."
+        " <label><input type=\"checkbox\" id=\"force\"> force (ganged / non-switching hubs)</label></p>\n"
+        "<table><thead><tr><th>BusID</th><th>Name</th><th>VID:PID</th><th>Device</th>"
+        "<th>Serial</th><th>Speed</th><th>mA</th><th>Port power</th></tr></thead>"
+        "<tbody id=\"ud\"><tr><td colspan=\"8\" class=\"muted\">Loading&hellip;</td></tr>\n", -1);
 
     /* Close the USB-devices section, then emit the page's <script> from
        the embedded web_app.js (see EMBED_TXTFILES in main/CMakeLists.txt).
@@ -932,6 +983,24 @@ static void stream_html_page(stream_t *s)
        escaped C string literals that the compiler can't validate. */
     stream_write(s,
         "</tbody></table></div>\n"
+        "<div id=\"sh\" class=\"sec\">\n"
+        "<h2>Hubs &amp; Port Power</h2>\n"
+        "<p class=\"sub\">Per-port power needs a hub reporting per-port switching;"
+        " ganged hubs switch all ports or none. Tick force on the USB Devices tab to send anyway.</p>\n"
+        "<div id=\"hubs\" class=\"muted\">Loading&hellip;</div>"
+        "<p class=\"sub\"><button onclick=\"allPorts('off')\">All ports off</button>"
+        " <button onclick=\"allPorts('on')\">All ports on</button></p></div>\n"
+        "<div id=\"sm\" class=\"sec\">\n"
+        "<h2>I2C Strand Mux</h2>\n"
+        "<p class=\"sub\">Active: <strong id=\"mact\">&hellip;</strong> <span id=\"mman\"></span>"
+        " <button onclick=\"muxIso()\">Isolate all</button>"
+        " <button onclick=\"muxProbe()\">Probe bus</button> <span id=\"mprobe\" class=\"muted\"></span></p>\n"
+        "<div id=\"mduts\"></div><div id=\"mgroups\"></div>\n"
+        "<h2>Topology</h2>\n"
+        "<textarea id=\"mtopo\"></textarea>\n"
+        "<p class=\"sub\"><button onclick=\"topoLoad()\">Reload</button>"
+        " <button onclick=\"topoSave()\">Validate &amp; save</button> <span id=\"mtst\" class=\"muted\"></span></p>"
+        "</div>\n"
         "<footer>USB/IP Bridge &mdash; <a href=\"/\" style=\"color:#555\">refresh</a></footer>\n"
         "<script>\n", -1);
     stream_write(s, _binary_web_app_js_start, -1);
@@ -1273,6 +1342,24 @@ static void handle_connection(int fd)
     body_buf[body_read] = '\0';  /* NUL-terminate for strstr-based parsers */
 
     const char *url = req.url;
+
+    /* Controller API: devices, hub port power, analog mux, MCP */
+    api_response_t ar;
+    if (controller_api_handle(req.method, url, req.auth[0] ? req.auth : NULL,
+                              body_buf, body_read, &ar)) {
+        send_api_response(fd, &ar);
+        cJSON_free(ar.body);
+        free(body_buf); free(buf);
+        return;
+    }
+
+    /* With an API token set, every other mutating request needs it too */
+    if (strcmp(req.method, "GET") != 0 && strcmp(req.method, "HEAD") != 0 &&
+            !controller_api_authorized(req.auth[0] ? req.auth : NULL)) {
+        free(body_buf); free(buf);
+        http_401(fd);
+        return;
+    }
 
     /* GET / — stream the HTML page */
     if (strcmp(url, "/") == 0 && strcmp(req.method, "GET") == 0) {

@@ -333,6 +333,28 @@ config USBIP_NEOPIXEL_GPIO
 
 endmenu
 
+menu "Analog I2C Mux Configuration"
+
+    config USBIP_MUX_I2C_SDA_GPIO
+        int "Mux control bus SDA GPIO (-1 to disable)"
+        default 2 if USBIP_BOARD_ESPRESSIF_ESP32S31_FUNCTION_COREBOARD_1
+        default -1
+        help
+            I2C bus that drives the ADG729/ADG728 analog switches routing the
+            shared I2C sensor chain to one DUT (see /api/topology).
+
+    config USBIP_MUX_I2C_SCL_GPIO
+        int "Mux control bus SCL GPIO (-1 to disable)"
+        default 3 if USBIP_BOARD_ESPRESSIF_ESP32S31_FUNCTION_COREBOARD_1
+        default -1
+
+    config USBIP_MUX_I2C_FREQ_HZ
+        int "Mux control bus clock (Hz)"
+        range 10000 400000
+        default 100000
+
+endmenu
+
 menu "Virtual Logic Capture Configuration"
 
     config USBIP_VIRTUAL_LOGIC_ANALYZER

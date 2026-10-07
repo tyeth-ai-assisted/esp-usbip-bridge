@@ -9,6 +9,7 @@
 #include "virtual_cdc.h"
 #include "harness_io.h"
 #include "harness_scpi.h"
+#include "scpi_controller.h"
 #include "harness_dut.h"
 
 static const char *TAG = "vdev_harness";
@@ -200,6 +201,7 @@ esp_err_t virtual_harness_start(void)
         .io = &s_io,
         .task_stack_size = 8192,
         .task_priority = 5,
+        .extra_commands = scpi_controller_commands(),
     };
     err = harness_scpi_init(&scpi_cfg);
     if (err != ESP_OK) {

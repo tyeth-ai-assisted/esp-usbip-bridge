@@ -14,6 +14,7 @@
 
 #include "sdkconfig.h"
 #include "usb/usb_host.h"
+#include "usb/usb_host_hub.h"
 #include "usb/usb_types_stack.h"
 
 #include "virtual_device.h"
@@ -94,6 +95,7 @@ typedef struct {
     usb_device_handle_t dev_hdl;
     usbip_backend_device_t device;
 } usb_backend_device_slot_t;
+
 
 typedef struct {
     SemaphoreHandle_t state_mutex;
@@ -244,6 +246,67 @@ static bool is_hub_device(const usb_device_desc_t *dev_desc, const usbip_backend
     }
 
     return false;
+}
+
+/* Copy a UTF-16LE string descriptor into a printable ASCII string. */
+static void str_desc_to_ascii(const usb_str_desc_t *desc, char *out, size_t out_size)
+{
+    if (out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (desc == NULL || desc->bLength < 2) {
+        return;
+    }
+    size_t n_chars = (desc->bLength - 2) / 2;
+    size_t o = 0;
+    for (size_t i = 0; i < n_chars && o + 1 < out_size; i++) {
+        uint16_t c = desc->wData[i];
+        if (c == 0) {
+            break;    /* some devices NUL-pad their strings */
+        }
+        out[o++] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+    }
+    out[o] = '\0';
+}
+
+#define USB_BACKEND_MAX_HUB_DEPTH 6
+
+/* Resolve the parent hub of a device and build its Linux style port path
+   ("1-1" on the root port, "1-1.3" on port 3 of the hub on the root port).
+   The root port is reported as port 1 of bus 1, like a Linux root hub.
+   Walks parent handles up to the root port; hubs stay alive while they
+   have children, so the handles are valid. */
+static void resolve_topology(const usb_device_info_t *dev_info,
+                             uint8_t *parent_hub_addr,
+                             uint8_t *parent_port,
+                             char *path, size_t path_size)
+{
+    uint8_t ports[USB_BACKEND_MAX_HUB_DEPTH];
+    size_t depth = 0;
+    *parent_hub_addr = 0;
+    *parent_port = 0;
+
+    usb_device_info_t info = *dev_info;
+    while (info.parent.dev_hdl != NULL && depth < USB_BACKEND_MAX_HUB_DEPTH) {
+        ports[depth++] = info.parent.port_num;
+        usb_device_info_t parent_info;
+        if (usb_host_device_info(info.parent.dev_hdl, &parent_info) != ESP_OK) {
+            /* Parent unknown: fall back to an address busid */
+            snprintf(path, path_size, "1-%u", dev_info->dev_addr);
+            return;
+        }
+        if (depth == 1) {
+            *parent_hub_addr = parent_info.dev_addr;
+            *parent_port = info.parent.port_num;
+        }
+        info = parent_info;
+    }
+
+    size_t off = strlcpy(path, "1-1", path_size);
+    while (depth > 0 && off < path_size) {
+        off += snprintf(path + off, path_size - off, ".%u", ports[--depth]);
+    }
 }
 
 static bool busid_matches_key(const char key[32], const char stored_busid[32])
@@ -450,7 +513,11 @@ static void export_new_device(uint8_t address)
     device.present = true;
     device.busnum = 1;
     device.devnum = dev_info.dev_addr;
+    device.dev_addr = dev_info.dev_addr;
     device.speed = usb_speed_to_usbip(dev_info.speed);
+    str_desc_to_ascii(dev_info.str_desc_manufacturer, device.manufacturer, sizeof(device.manufacturer));
+    str_desc_to_ascii(dev_info.str_desc_product, device.product, sizeof(device.product));
+    str_desc_to_ascii(dev_info.str_desc_serial_num, device.serial, sizeof(device.serial));
 
     device.id_vendor = dev_desc->idVendor;
     device.id_product = dev_desc->idProduct;
@@ -465,6 +532,7 @@ static void export_new_device(uint8_t address)
     err = usb_host_get_active_config_descriptor(dev_hdl, &config_desc);
     if (err == ESP_OK && config_desc != NULL) {
         parse_descriptors(config_desc, &device);
+        device.max_power_ma = (uint16_t)config_desc->bMaxPower * 2;
     }
 
     if (is_hub_device(dev_desc, &device)) {
@@ -473,12 +541,20 @@ static void export_new_device(uint8_t address)
         return;
     }
 
-    snprintf(device.busid, sizeof(device.busid), "1-%u", dev_info.dev_addr);
-    snprintf(device.path, sizeof(device.path), "/esp-usb-host/1-%u", dev_info.dev_addr);
+    char port_path[32];
+    resolve_topology(&dev_info, &device.parent_hub_addr, &device.parent_port,
+                     port_path, sizeof(port_path));
 
     xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
 
-    const int existing_slot = find_slot_by_devnum_locked(device.devnum);
+    strlcpy(device.busid, port_path, sizeof(device.busid));
+    snprintf(device.path, sizeof(device.path), "/esp-usb-host/%s", port_path);
+
+    int existing_slot = find_slot_by_devnum_locked(device.devnum);
+    if (existing_slot >= 0) {
+        close_slot_locked(existing_slot);
+    }
+    existing_slot = find_slot_by_busid_locked(device.busid);
     if (existing_slot >= 0) {
         close_slot_locked(existing_slot);
     }
@@ -501,11 +577,12 @@ static void export_new_device(uint8_t address)
 
     xSemaphoreGive(s_state.state_mutex);
 
-    ESP_LOGD(TAG,
-             "Exporting USB device busid=%s vid=%04x pid=%04x",
+    ESP_LOGI(TAG,
+             "Exporting USB device busid=%s vid=%04x pid=%04x (address %u)",
              device.busid,
              device.id_vendor,
-             device.id_product);
+             device.id_product,
+             device.dev_addr);
 }
 
 static void remove_gone_device(usb_device_handle_t dev_hdl)
@@ -967,6 +1044,66 @@ size_t usb_backend_get_devices(usbip_backend_device_t *out_devices, size_t max_d
         copied += virtual_device_get_all(out_devices + copied, max_devices - copied);
     }
 
+    return copied;
+}
+
+/* Hubs are owned by the USB Host Library and never reported to clients, so
+   ask the library for them and rebuild each hub's port path from the parent
+   links (a hub's parent is always another hub or the root port). */
+size_t usb_backend_get_hubs(usb_backend_hub_t *out_hubs, size_t max_hubs)
+{
+    if (out_hubs == NULL || max_hubs == 0 || s_state.client_hdl == NULL) {
+        return 0;
+    }
+    uint8_t addrs[USB_BACKEND_MAX_HUBS];
+    size_t count = 0;
+    if (usb_host_hub_list(addrs, USB_BACKEND_MAX_HUBS, &count) != ESP_OK) {
+        return 0;
+    }
+    if (count > USB_BACKEND_MAX_HUBS) {
+        count = USB_BACKEND_MAX_HUBS;
+    }
+
+    usb_host_hub_info_t infos[USB_BACKEND_MAX_HUBS];
+    size_t n = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (usb_host_hub_get_info(addrs[i], &infos[n]) == ESP_OK) {
+            n++;
+        }
+    }
+
+    size_t copied = 0;
+    for (size_t i = 0; i < n && copied < max_hubs; i++) {
+        usb_backend_hub_t *hub = &out_hubs[copied++];
+        memset(hub, 0, sizeof(*hub));
+        hub->addr = infos[i].dev_addr;
+        hub->parent_hub_addr = infos[i].parent_addr;
+        hub->parent_port = infos[i].parent_port;
+        hub->id_vendor = infos[i].vid;
+        hub->id_product = infos[i].pid;
+        strlcpy(hub->manufacturer, infos[i].manufacturer, sizeof(hub->manufacturer));
+        strlcpy(hub->product, infos[i].product, sizeof(hub->product));
+
+        /* Walk up the parent chain collecting port numbers */
+        uint8_t ports[USB_BACKEND_MAX_HUB_DEPTH];
+        size_t depth = 0;
+        const usb_host_hub_info_t *cur = &infos[i];
+        while (cur != NULL && cur->parent_addr != 0 && depth < USB_BACKEND_MAX_HUB_DEPTH) {
+            ports[depth++] = cur->parent_port;
+            const usb_host_hub_info_t *parent = NULL;
+            for (size_t k = 0; k < n; k++) {
+                if (infos[k].dev_addr == cur->parent_addr) {
+                    parent = &infos[k];
+                    break;
+                }
+            }
+            cur = parent;
+        }
+        size_t off = strlcpy(hub->path, "1-1", sizeof(hub->path));
+        while (depth > 0 && off < sizeof(hub->path)) {
+            off += snprintf(hub->path + off, sizeof(hub->path) - off, ".%u", ports[--depth]);
+        }
+    }
     return copied;
 }
 

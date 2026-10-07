@@ -197,6 +197,78 @@ sudo usbip attach -r <bridge-ip-or-hostname> -b 1-<devaddr>
 
 Example bus ID format from this firmware: `1-1`.
 
+## Controller API (HTTP, MCP, SCPI)
+
+Besides USB/IP, the bridge serves a controller API on port 80 for people
+(the web page), scripts and agents. `GET /api/schema` lists every endpoint.
+
+**Bus IDs are Linux style port paths** (`1-1.3` = port 3 of the hub on the
+root port), so a device keeps its busid when it re-enumerates, and
+`usbip list -r` / `usbip attach -b` work like against a Linux host.
+Virtual devices are on bus 2.
+
+### USB devices and hub port power
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/usb/devices` | VID/PID, manufacturer/product/serial strings, speed, MaxPower, interfaces, hub/port and port power state |
+| GET | `/api/usb/devices/{busid}` | one device, 404 when absent (presence check) |
+| GET | `/api/usb/hubs` | hubs with power switching mode (`per-port`, `ganged`, `none`) and every port's state |
+| GET | `/api/ports`, `/api/ports/{port}` | flat port list (also at `/ports`) |
+| POST | `/api/ports/{port}/on`, `/off` | SetPortFeature/ClearPortFeature PORT_POWER, body `{"force":bool}` |
+| POST | `/api/ports/{port}/cycle` | off, wait `off_ms` (default 1000), on; runs in the background |
+| POST | `/api/ports/off`, `/api/ports/on` | every per-port switched port that does not lead to a hub |
+| POST | `/api/usb/debug` | log the USB host's hub, port and enumeration state to the console |
+
+Port power is refused (409) unless `force` is set when the hub does not report
+per-port power switching (ganged hubs switch all ports or none, and many cheap
+hubs have no switches at all), and when powering off a port that leads to
+another hub. A port that was switched off stays off until switched on again.
+
+### I2C strand mux
+
+A C port of
+[sbc-dut-analog-mux-api-circuitpy](https://github.com/Gundry-Consultancy/sbc-dut-analog-mux-api-circuitpy)
+with the same API, so its existing clients (including the HIL controller's
+`select_i2c_strand` stage) can point at the bridge: `GET /api/status`,
+`GET /api/duts`, `POST /api/select {"dut"}`, `POST /api/isolate`,
+`POST /api/groups/{group}/select/{channel}`, `POST /api/groups/{group}/channel`,
+`GET|PUT /api/topology`, `GET /api/probe`. ADG729 (dual 4:1) and ADG728 pairs
+(8:1 SDA + 8:1 SCL) are supported; selection is break-before-make across all
+groups. The topology is stored in NVS. The control bus pins are
+`CONFIG_USBIP_MUX_I2C_SDA_GPIO`/`SCL_GPIO` (GPIO2/GPIO3 on the
+ESP32-S31-Function-CoreBoard-1, unset elsewhere). The bus needs external pull-ups
+(about 4.7 kOhm); with only the internal ones `/api/probe` reports phantom
+devices.
+
+### Auth
+
+`POST /api/auth/token {"token": "..."}` sets a token (empty clears it). Once set,
+every non-GET request (and `/api/select/*`) needs `Authorization: Bearer <token>`.
+The web page has a token field.
+
+### MCP
+
+`POST /mcp` is a stateless Model Context Protocol endpoint (Streamable HTTP,
+JSON responses) with tools `list_usb_devices`, `get_usb_device`, `list_hubs`,
+`set_port_power`, `power_cycle_port`, `set_device_name`, `mux_status`,
+`mux_select`, `mux_isolate`, `mux_set_channel`, `mux_get_topology`,
+`mux_set_topology` and `get_bridge_info`. For example with Claude Code:
+
+```bash
+claude mcp add --transport http usbip-bridge http://usbip-xxxxxx.local/mcp
+```
+
+Add `--header "Authorization: Bearer <token>"` when a token is set.
+
+### SCPI
+
+The virtual test harness device (USB/IP busid `2-1`, CDC-ACM) also accepts
+`HUB:LIST?`, `HUB:PORT:POWer "1-1.3",ON|OFF[,FORCE]`, `HUB:PORT:POWer? "1-1.3"`,
+`HUB:PORT:CYCLe "1-1.3"[,<off_ms>[,FORCE]]`, `USB:DEVices?`, `MUX:SELect "dut"`,
+`MUX:SELect:CHANnel "group",<n>`, `MUX:ISOLate`, `MUX:ACTive?` and
+`MUX:STATus?` (JSON answers for list queries).
+
 ## Service Discovery (mDNS / DNS-SD)
 
 USB/IP protocol itself does not define mDNS discovery. This firmware advertises a custom DNS-SD service:

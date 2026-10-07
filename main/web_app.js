@@ -58,7 +58,7 @@ function spul(sel) {
 
 /* Switch between the GPIO-pins and USB-devices tabs. */
 function st(n) {
-  ['p', 'u'].forEach(function (x) {
+  ['p', 'u', 'h', 'm'].forEach(function (x) {
     document.getElementById('t' + x).className = '';
     document.getElementById('s' + x).className = 'sec';
   });
@@ -316,7 +316,230 @@ function cfgClearCancel() {
   }
 }
 
+/* ---------------------------------------------------------------------
+ *  API token: sent as a Bearer token on every non-GET request
+ * ------------------------------------------------------------------- */
+function tokGet() {
+  try { return localStorage.getItem('usbipToken') || ''; } catch (e) { return ''; }
+}
+
+(function () {
+  var open = XMLHttpRequest.prototype.open;
+  var send = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function (m) {
+    this._m = m;
+    return open.apply(this, arguments);
+  };
+  XMLHttpRequest.prototype.send = function () {
+    var t = tokGet();
+    if (t && this._m && this._m.toUpperCase() != 'GET') {
+      this.setRequestHeader('Authorization', 'Bearer ' + t);
+    }
+    return send.apply(this, arguments);
+  };
+})();
+
+function tokSave() {
+  try { localStorage.setItem('usbipToken', document.getElementById('tok').value); } catch (e) {}
+  authStatus();
+}
+
+function tokSet() {
+  var v = document.getElementById('tok').value;
+  if (!confirm(v ? 'Require this token for changes on the bridge?' : 'Clear the bridge token (no auth)?')) return;
+  api('POST', '/api/auth/token', { token: v }, function (ok, r) {
+    if (!ok) { alert('Failed: ' + (r && r.error)); return; }
+    tokSave();
+  });
+}
+
+function authStatus() {
+  api('GET', '/api/auth', null, function (ok, r) {
+    var e = document.getElementById('authst');
+    if (ok && e) e.textContent = r.auth_required ? '(bridge requires a token)' : '(no token required)';
+  });
+}
+
+/* JSON request helper: cb(ok, body) */
+function api(method, path, body, cb) {
+  var x = new XMLHttpRequest();
+  x.open(method, path, true);
+  x.setRequestHeader('Content-Type', 'application/json');
+  x.onload = function () {
+    var r = null;
+    try { r = JSON.parse(x.responseText); } catch (e) {}
+    if (cb) cb(x.status >= 200 && x.status < 300, r, x.status);
+  };
+  x.onerror = function () { if (cb) cb(false, { error: 'network error' }, 0); };
+  x.send(body === null || body === undefined ? null : JSON.stringify(body));
+}
+
+function esc(s) {
+  return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+/* ---------------------------------------------------------------------
+ *  USB devices and hub port power
+ * ------------------------------------------------------------------- */
+function forceOn() {
+  var f = document.getElementById('force');
+  return !!(f && f.checked);
+}
+
+function pw(port, action) {
+  var body = { force: forceOn() };
+  if (action == 'cycle') body.off_ms = 1000;
+  api('POST', '/api/ports/' + encodeURIComponent(port) + '/' + action, body, function (ok, r) {
+    if (!ok) alert(port + ' ' + action + ': ' + (r && r.error));
+    setTimeout(refreshUsb, action == 'cycle' ? 2500 : 600);
+  });
+}
+
+function allPorts(action) {
+  if (!confirm('Switch ' + action + ' every per-port switched hub port?')) return;
+  api('POST', '/api/ports/' + action, null, function (ok, r) {
+    if (!ok) alert(r && r.error);
+    setTimeout(refreshUsb, 1000);
+  });
+}
+
+function powerButtons(port) {
+  var p = esc(port);
+  return '<button onclick="pw(\'' + p + '\',\'on\')">On</button>' +
+         '<button onclick="pw(\'' + p + '\',\'off\')">Off</button>' +
+         '<button onclick="pw(\'' + p + '\',\'cycle\')">Cycle</button>';
+}
+
+function loadDevs() {
+  api('GET', '/api/usb/devices', null, function (ok, r) {
+    var tb = document.getElementById('ud');
+    if (!tb || !ok) return;
+    var h = '';
+    r.devices.forEach(function (d) {
+      var pwr = d.virtual ? '<span class="muted">virtual</span>'
+              : d.hub ? (esc(d.port_power_status || '?') + ' ' + powerButtons(d.busid))
+              : '<span class="muted">root port</span>';
+      h += '<tr><td><strong>' + esc(d.busid) + '</strong></td>' +
+           '<td>' + esc(d.name) + '</td>' +
+           '<td>' + esc(d.vid) + ':' + esc(d.pid) + '</td>' +
+           '<td>' + esc(d.manufacturer) + ' ' + esc(d.product) + '</td>' +
+           '<td>' + esc(d.serial) + '</td>' +
+           '<td>' + esc(d.speed) + '</td>' +
+           '<td>' + esc(d.max_power_ma) + '</td>' +
+           '<td>' + pwr + '</td></tr>';
+    });
+    tb.innerHTML = h || '<tr><td colspan="8" class="muted">No USB devices</td></tr>';
+  });
+}
+
+function loadHubs() {
+  api('GET', '/api/usb/hubs', null, function (ok, r) {
+    var el = document.getElementById('hubs');
+    if (!el || !ok) return;
+    if (!r.hubs.length) { el.innerHTML = 'No hubs attached'; return; }
+    var h = '';
+    r.hubs.forEach(function (hub) {
+      h += '<div class="hub"><strong>' + esc(hub.path) + '</strong> ' + esc(hub.vid) + ':' + esc(hub.pid) +
+           ' ' + esc(hub.product) + ' &mdash; ' + esc(hub.num_ports) + ' ports, power switching <strong>' +
+           esc(hub.power_switching) + '</strong>, PwrOn2PwrGood ' + esc(hub.pwr_on_to_pwr_good_ms) + ' ms</div>';
+      h += '<table><thead><tr><th>Port</th><th>Power</th><th>Link</th><th>Speed</th><th>Attached</th><th>Action</th></tr></thead><tbody>';
+      hub.ports.forEach(function (p) {
+        var dev = p.device ? (esc(p.device.type) + ' ' + esc(p.device.vid) + ':' + esc(p.device.pid)) : '';
+        h += '<tr><td>' + esc(p.path) + '</td>' +
+             '<td class="' + (p.power == 'on' ? 'hi' : 'lo') + '">' + esc(p.power) + (p.user_off ? ' (switched off)' : '') +
+             (p.over_current ? ' <span class="lo">OVER-CURRENT</span>' : '') + '</td>' +
+             '<td>' + (p.connected ? 'connected' : '<span class="muted">-</span>') + '</td>' +
+             '<td>' + esc(p.speed) + '</td><td>' + dev + '</td>' +
+             '<td>' + powerButtons(p.path) + '</td></tr>';
+      });
+      h += '</tbody></table>';
+    });
+    el.innerHTML = h;
+  });
+}
+
+function refreshUsb() {
+  loadDevs();
+  loadHubs();
+}
+
+/* ---------------------------------------------------------------------
+ *  I2C strand mux
+ * ------------------------------------------------------------------- */
+function muxErr(ok, r) {
+  if (!ok) alert((r && r.error) || 'failed');
+  loadMux();
+}
+
+function muxSel(dut) { api('POST', '/api/select', { dut: dut }, muxErr); }
+function muxIso() { api('POST', '/api/isolate', null, muxErr); }
+function muxCh(g, ch, closed) {
+  api('POST', '/api/groups/' + encodeURIComponent(g) + '/channel', { channel: ch, closed: closed }, muxErr);
+}
+function muxGrpSel(g, ch) {
+  api('POST', '/api/groups/' + encodeURIComponent(g) + '/select/' + ch, null, muxErr);
+}
+
+function loadMux() {
+  api('GET', '/api/status', null, function (ok, r) {
+    if (!ok) return;
+    document.getElementById('mact').textContent = r.active || 'none (isolated)';
+    document.getElementById('mman').textContent = r.manual ? '(manual)' : '';
+    var h = '';
+    r.duts.forEach(function (d) {
+      h += '<button class="' + (d.active ? 'act' : '') + '" onclick="muxSel(\'' + esc(d.name) + '\')">' +
+           esc(d.name) + ' <span class="muted">' + esc(d.group) + ':' + d.channel + '</span></button> ';
+    });
+    document.getElementById('mduts').innerHTML = h ? '<p class="sub">' + h + '</p>' : '<p class="sub muted">No DUTs in the topology</p>';
+    var g = '';
+    r.groups.forEach(function (grp) {
+      g += '<div class="hub"><strong>' + esc(grp.name) + '</strong> ' + esc(grp.addresses.join(', ')) + '</div><p class="sub">';
+      grp.channels.forEach(function (c) {
+        g += '<label><input type="checkbox"' + (c.closed ? ' checked' : '') +
+             ' onchange="muxCh(\'' + esc(grp.name) + '\',' + c.channel + ',this.checked)"> ch' + c.channel +
+             (c.dut ? ' <span class="muted">' + esc(c.dut) + '</span>' : '') + '</label> ' +
+             '<button onclick="muxGrpSel(\'' + esc(grp.name) + '\',' + c.channel + ')">only</button> &nbsp; ';
+      });
+      g += '</p>';
+    });
+    document.getElementById('mgroups').innerHTML = g;
+  });
+}
+
+function muxProbe() {
+  api('GET', '/api/probe', null, function (ok, r) {
+    document.getElementById('mprobe').textContent = ok
+      ? 'found: ' + (r.scan.join(', ') || 'nothing') : (r && r.error);
+  });
+}
+
+function topoLoad() {
+  api('GET', '/api/topology', null, function (ok, r) {
+    if (ok) document.getElementById('mtopo').value = JSON.stringify(r, null, 2);
+  });
+}
+
+function topoSave() {
+  var t;
+  try { t = JSON.parse(document.getElementById('mtopo').value); } catch (e) { alert('Invalid JSON: ' + e); return; }
+  api('PUT', '/api/topology', t, function (ok, r) {
+    document.getElementById('mtst').textContent = ok ? (r.saved ? 'saved' : ('applied, not saved: ' + r.note)) : (r && r.error);
+    loadMux();
+  });
+}
+
 /* Refresh pin values, wire names, directions and pull states on initial
    load.  Wire names are also pre-filled server-side in the HTML, but this
    keeps the live state (values/pulls) current too. */
 rp();
+document.getElementById('tok').value = tokGet();
+authStatus();
+refreshUsb();
+loadMux();
+topoLoad();
+setInterval(function () {
+  var u = document.getElementById('su'), hb = document.getElementById('sh');
+  if ((u && u.className.indexOf('on') >= 0) || (hb && hb.className.indexOf('on') >= 0)) refreshUsb();
+}, 3000);

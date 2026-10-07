@@ -44,7 +44,30 @@ typedef struct {
     usbip_backend_interface_t interfaces[USBIP_MAX_INTERFACES];
     uint8_t num_endpoints;
     usbip_backend_endpoint_t endpoints[USBIP_MAX_ENDPOINTS];
+
+    /* Topology and descriptor details (zero/empty for virtual devices) */
+    uint8_t dev_addr;               /* USB device address */
+    uint8_t parent_hub_addr;        /* 0 when on the root port */
+    uint8_t parent_port;            /* port number on the parent hub, 0 on the root port */
+    uint16_t max_power_ma;          /* from bMaxPower of the active configuration */
+    char manufacturer[64];
+    char product[64];
+    char serial[64];
 } usbip_backend_device_t;
+
+#define USB_BACKEND_MAX_HUBS 8
+
+/* An external hub managed by the USB Host Library (hubs are not exported). */
+typedef struct {
+    uint8_t addr;
+    uint8_t parent_hub_addr;        /* 0 when on the root port */
+    uint8_t parent_port;
+    char path[32];                  /* Linux style port path, e.g. "1-1" or "1-1.4" */
+    uint16_t id_vendor;
+    uint16_t id_product;
+    char manufacturer[64];
+    char product[64];
+} usb_backend_hub_t;
 
 esp_err_t usb_backend_start(void);
 size_t usb_backend_get_devices(usbip_backend_device_t *out_devices, size_t max_devices);
@@ -74,5 +97,8 @@ int usb_backend_interrupt_transfer(const char busid[32],
                                    size_t *in_len,
                                    volatile bool *cancel);
 bool usb_backend_is_interrupt_endpoint(const char busid[32], uint8_t ep_num, uint8_t direction);
+
+/* Snapshot of the external hubs currently attached. */
+size_t usb_backend_get_hubs(usb_backend_hub_t *out_hubs, size_t max_hubs);
 
 #endif

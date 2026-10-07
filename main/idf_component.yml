@@ -1,12 +1,15 @@
 dependencies:
   idf:
     version: ">=6.0.0-beta2"
+  # adafruit/esp-usb fsls-only + hub port power API and hub handling fixes
   espressif/usb:
-    git: https://github.com/adafruit/esp-usb.git
+    git: https://github.com/tyeth-ai-assisted/esp-usb.git
     path: host/usb
-    version: fsls-only
+    version: 5843672208d59b18204d927ff5d98024c6ce37d9
   espressif/mdns:
     version: ">=1.9.1"
+  espressif/cjson:
+    version: ">=1.7.17"
   logic_capture:
     git: https://github.com/adafruit/esp-perfetto-logic.git
     path: components/logic_capture
