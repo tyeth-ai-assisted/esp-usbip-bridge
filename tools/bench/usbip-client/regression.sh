@@ -5,14 +5,23 @@
 #   uf2      picotool save -a of the whole flash, then copy it back as a UF2 (4 MiB write)
 #   esptool  esptool --no-stub flash_id twice on one attach (ESPTOOL_BUSID), no "cannot find a urb"
 #   msc      read/write 64 KiB on each mass-storage drive in MSC_BUSIDS
-#   timeout  a 20 s libusb bulk read on an idle CDC data endpoint ends after the bridge's 5 s
-#            deadline with URB status -110 (ETIMEDOUT)
+#   open     a pyserial open of each idle CDC port in OPEN_BUSIDS takes under 1 s (cdc-acm's 16
+#            pending reads must not delay its control requests; it used to take 9-18 s)
+#   idle     the quiet CDC console IDLE_BUSID, left open and idle for IDLE_SECS with cdc-acm's 16
+#            reads pending, has no failed URB (no -110 timeouts, no -104 sibling cancels) and
+#            still answers Ctrl-C/Enter, twice
+#   timeout  a 20 s libusb bulk read on IDLE_BUSID's idle CDC data endpoint is never timed out by
+#            the bridge (no URB status -110); libusb's own timeout unlinks it (LIBUSB_ERROR_TIMEOUT,
+#            -7) and the console still answers afterwards
 #
 #   regression.sh [test ...]     (default: all, in the order above)
 . "$(dirname "$0")/lib.sh"
 RP2040_BUSID="${RP2040_BUSID:-1-1.4}"
 ESPTOOL_BUSID="${ESPTOOL_BUSID:-1-1.3}"
 MSC_BUSIDS="${MSC_BUSIDS:-1-1.1.3 1-1.2}"
+OPEN_BUSIDS="${OPEN_BUSIDS:-1-1.4 1-1.1.1}"
+IDLE_BUSID="${IDLE_BUSID:-1-1.1.1}"      # Feather S3 Reverse TFT: prints nothing unless poked
+IDLE_SECS="${IDLE_SECS:-25}"
 FAIL=0
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*"; FAIL=1; }
@@ -84,22 +93,56 @@ t_msc() {
   done
 }
 
-t_timeout() {
-  # The RP2040's CircuitPython CDC data endpoint NAKs while nothing is printed.
-  cleanup_vhci; sleep 6
+# The RP2040 must be running CircuitPython (not left in BOOTSEL by an earlier test).
+rp2040_app() {
   if [ "$(bridge_dev "$RP2040_BUSID")" = "2e8a:0003" ]; then
-    # Left in BOOTSEL by an earlier test: back to the application
     attach "$RP2040_BUSID" >/dev/null; sleep 5
     timeout 30 picotool reboot >/dev/null 2>&1; sleep 2; cleanup_vhci
   fi
-  wait_bridge_dev "$RP2040_BUSID" 2e8a:f00a 20 || { fail "timeout: $RP2040_BUSID is not running its application"; return; }
-  attach "$RP2040_BUSID" >/dev/null; sleep 3
-  local ifep; ifep=$(lsusb -v -d 2e8a:f00a 2>/dev/null | awk '/bInterfaceNumber/{i=$2} /bInterfaceClass/{c=$2} /bEndpointAddress/ && /IN/ && c==10 {print i, $2; exit}')
+  wait_bridge_dev "$RP2040_BUSID" 2e8a:f00a 20
+}
+
+t_open() {
+  local b
+  for b in $OPEN_BUSIDS; do
+    cleanup_vhci; sleep 3
+    [ "$b" = "$RP2040_BUSID" ] && { rp2040_app || { fail "open $b: not running its application"; continue; }; }
+    local lb tty; lb=$(attach "$b"); tty=$(tty_of "$lb")
+    [ -z "$tty" ] && { fail "open $b: no ttyACM"; continue; }
+    local times worst; times=$(serial_open_times "$tty" 3 | tr '\n' ' ')
+    worst=$(echo "$times" | tr ' ' '\n' | sort -n | tail -1)
+    [ -n "$worst" ] && awk -v w="$worst" 'BEGIN{exit !(w < 1.0)}' \
+      && pass "open $b: serial open times $times s" || fail "open $b: serial open times $times s (limit 1.0 s)"
+  done
+}
+
+t_idle() {
+  cleanup_vhci; sleep 3
+  acm_debug_on
+  local tag=idle-$(date +%s); mark "$tag"
+  local lb tty; lb=$(attach "$IDLE_BUSID"); tty=$(tty_of "$lb")
+  [ -z "$tty" ] && { fail "idle: no ttyACM on $IDLE_BUSID"; return; }
+  local r1 r2 errs; r1=$(console_probe "$tty" "$IDLE_SECS"); r2=$(console_probe "$tty" 10)
+  errs=$(acm_read_errors_since "$tag")
+  [ "$errs" -eq 0 ] && pass "idle: no failed cdc-acm read in $IDLE_SECS s + 10 s with the port open" \
+    || fail "idle: $errs failed cdc-acm reads while idle: $(dmesg_since "$tag" | grep -o ': -1[0-9][0-9]' | sort | uniq -c | tr '\n' ' ')"
+  case "$r1" in ANSWERED*) pass "idle: console answers after $IDLE_SECS s idle ($r1)";; *) fail "idle: after $IDLE_SECS s idle: $r1";; esac
+  case "$r2" in ANSWERED*) pass "idle: console answers again after 10 s more ($r2)";; *) fail "idle: second probe: $r2";; esac
+}
+
+t_timeout() {
+  # IDLE_BUSID's CDC data endpoint NAKs while nothing is printed.
+  cleanup_vhci; sleep 6
+  local vidpid; vidpid=$(bridge_dev "$IDLE_BUSID")
+  [ -z "$vidpid" ] && { fail "timeout: $IDLE_BUSID is not attached to the bridge"; return; }
+  local lb tty; lb=$(attach "$IDLE_BUSID"); tty=$(tty_of "$lb")
+  local ifep; ifep=$(lsusb -v -d "$vidpid" 2>/dev/null | awk '/bInterfaceNumber/{i=$2} /bInterfaceClass/{c=$2} /bEndpointAddress/ && /IN/ && c==10 {print i, $2; exit}')
   local out
-  out=$(IFEP="$ifep" LIBUSB_DEBUG=2 python3 - 2>&1 <<'PY'
+  out=$(IFEP="$ifep" VIDPID="$vidpid" LIBUSB_DEBUG=2 python3 - 2>&1 <<'PY'
 import ctypes, ctypes.util, os, time
 intf, ep = os.environ["IFEP"].split()
 intf, ep = int(intf), int(ep, 16)
+vid, pid = (int(x, 16) for x in os.environ["VIDPID"].split(":"))
 lib = ctypes.CDLL(ctypes.util.find_library("usb-1.0") or "libusb-1.0.so.0")
 lib.libusb_open_device_with_vid_pid.restype = ctypes.c_void_p
 lib.libusb_open_device_with_vid_pid.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_uint16]
@@ -110,7 +153,7 @@ for f in ("libusb_detach_kernel_driver", "libusb_claim_interface", "libusb_relea
     getattr(lib, f).argtypes = [ctypes.c_void_p, ctypes.c_int]
 lib.libusb_close.argtypes = [ctypes.c_void_p]
 lib.libusb_init(None)
-h = lib.libusb_open_device_with_vid_pid(None, 0x2e8a, 0xf00a)
+h = lib.libusb_open_device_with_vid_pid(None, vid, pid)
 lib.libusb_detach_kernel_driver(h, intf); lib.libusb_claim_interface(h, intf)
 buf = ctypes.create_string_buffer(64); got = ctypes.c_int(0)
 t = time.time(); r = lib.libusb_bulk_transfer(h, ep, buf, 64, ctypes.byref(got), 20000)
@@ -118,11 +161,26 @@ print("elapsed %.1f ret %d" % (time.time() - t, r))
 lib.libusb_release_interface(h, intf); lib.libusb_attach_kernel_driver(h, intf); lib.libusb_close(h)
 PY
 )
-  echo "$out" | grep -q "urb status -110" && pass "timeout: bridge deadline reaches Linux as -110 ($(echo "$out" | grep elapsed))" \
-    || fail "timeout: $(echo "$out" | tail -2 | tr '\n' ' ')"
+  local el; el=$(echo "$out" | grep elapsed)
+  # WSL's clock can jump, so accept anything well past the old 5 s deadline.
+  if echo "$out" | grep -q "urb status -110"; then
+    fail "timeout: the bridge timed the idle read out (-110): $el"
+  elif echo "$el" | grep -q "ret -7" && echo "$el" | awk '{exit !($2 >= 15)}'; then
+    pass "timeout: idle read pending until libusb's own 20 s timeout ($el)"
+  else
+    fail "timeout: $(echo "$out" | tail -2 | tr '\n' ' ')"
+  fi
+  # The unlinked read was in flight on the endpoint: the port must still work.
+  # libusb only re-attaches the data interface, which cdc-acm does not probe,
+  # so re-probe the whole device to get the tty back.
+  echo "$lb" > /sys/bus/usb/drivers/usb/unbind 2>/dev/null; sleep 1
+  echo "$lb" > /sys/bus/usb/drivers/usb/bind 2>/dev/null
+  tty=$(tty_of "$lb")
+  local r; r=$(console_probe "$tty" 1)
+  case "$r" in ANSWERED*) pass "timeout: console still answers after the unlink ($r)";; *) fail "timeout: console after the unlink: $r";; esac
 }
 
-TESTS="${*:-bootsel uf2 esptool msc timeout}"
+TESTS="${*:-bootsel uf2 esptool msc open idle timeout}"
 for t in $TESTS; do echo "##### $t"; "t_$t"; done
 cleanup_vhci
 [ $FAIL -eq 0 ] && echo "ALL PASSED" || { echo "SOME FAILED"; exit 1; }

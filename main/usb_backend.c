@@ -33,16 +33,33 @@
 #define USB_BACKEND_DAEMON_TASK_STACK 4096
 #define USB_BACKEND_DAEMON_TASK_PRIORITY 10
 
-#define USB_BACKEND_NUM_PIPES CONFIG_USBIP_NUM_PIPES
-
-/* Software deadline for a transfer (the host library ignores timeout_ms). */
-#define USB_BACKEND_XFER_TIMEOUT_MS 5000
-/* How long a cancelled control transfer may take to come back before its
-   slot is orphaned instead (it normally takes a few ms). */
+/* Transfers in flight at the USB host (every kind, all devices). */
+#define USB_BACKEND_MAX_INFLIGHT CONFIG_USBIP_MAX_INFLIGHT_XFERS
+/* Of those, bulk/interrupt IN transfers may hold at most this many, so
+   pending reads (which a device NAKs until it has data, possibly for ever)
+   can never starve OUT data and control requests. */
+#define USB_BACKEND_RESERVED_XFERS 8
+#define USB_BACKEND_MAX_IN_INFLIGHT (USB_BACKEND_MAX_INFLIGHT - USB_BACKEND_RESERVED_XFERS)
+/* Pending IN transfers per endpoint; further reads wait in the request
+   queue until one completes. */
+#define USB_BACKEND_MAX_IN_PER_EP CONFIG_USBIP_MAX_IN_XFERS_PER_ENDPOINT
+/* Software deadline for a control transfer (the host library ignores
+   timeout_ms); 0 = none.  Bulk and interrupt transfers have no deadline:
+   as on a Linux host they stay pending until the device answers, the
+   client unlinks them, or the device is gone. */
+#define USB_BACKEND_CTRL_TIMEOUT_MS CONFIG_USBIP_CTRL_XFER_TIMEOUT_MS
+/* How long a cancelled transfer may take to come back before its caller is
+   answered anyway and the host transfer is kept until it completes (an
+   orphan; the cancel normally takes a few ms). */
 #define USB_BACKEND_CANCEL_WAIT_MS 1000
-/* Control transfers retired by another transfer's EP0 flush are submitted
-   again, at most this many times. */
-#define USB_BACKEND_MAX_CTRL_RESUBMITS 3
+/* Transfers retired by another transfer's halt/flush of the same endpoint
+   (or EP0) are submitted again, at most this many times. */
+#define USB_BACKEND_MAX_RESUBMITS 8
+/* Poll period of the backend task: control deadlines, cancel waits and EP0
+   retries are checked this often; completions wake it at once. */
+#define USB_BACKEND_POLL_MS 10
+/* Endpoints halted and flushed in one pass of the backend task. */
+#define USB_BACKEND_MAX_FLUSHED_PER_PASS 16
 
 #ifndef USB_CLASS_HUB
 #define USB_CLASS_HUB 0x09
@@ -63,64 +80,60 @@ typedef struct {
     } u;
 } usb_backend_event_t;
 
-/* Unified per-pipe request slot.  One slot per host pipe, allocated
-   dynamically per URB from a shared pool.  The caller takes a counting
-   semaphore to reserve capacity, fills a free slot, sets active = true,
-   notifies the backend task, then waits on done_sem.  After completion
-   the slot is freed back to the pool.
-
-   Transfers are submitted non-blocking: the backend task submits all
-   active pipes to the DWC hardware concurrently, then polls for
-   completion or timeout. */
-typedef struct {
-    bool assigned;                  /* true = reserved for a device+endpoint */
-    volatile bool active;           /* true = caller queued a transfer */
-    volatile bool submitted;        /* true = transfer handed to DWC hw */
-    volatile bool completed;        /* true = DWC callback has fired */
-    volatile bool aborted;          /* true = we forced abort (timeout/cancel) */
-    bool cancel_sent;               /* usb_host_transfer_cancel_control() called */
-    TickType_t cancel_tick;         /* when it was called */
-    uint8_t resubmits;              /* resubmissions after a collateral EP0 flush */
-    bool orphaned;                  /* caller answered, transfer still in flight (state_mutex) */
-    bool caller_left;               /* caller returned while orphaned (state_mutex) */
+/* A transfer in flight at the USB host.  The backend task admits requests
+   from the waiting queue into these, in order, and owns them; other tasks
+   only read the in-flight list under state_mutex.  The request is detached
+   (req = NULL) once its caller has been answered while the host transfer
+   is still in flight (an orphan): the host transfer is then freed when its
+   callback fires. */
+typedef struct xfer {
+    struct xfer *next;              /* in-flight list, in submission order */
+    usb_backend_req_t *req;         /* NULL = orphan */
+    uint32_t seq;
 
     char busid[32];
     uint8_t endpoint_addr;          /* 0 for control, 0x8N for IN, 0x0N for OUT */
     usb_setup_packet_t setup;       /* only used when endpoint_addr == 0 */
-    const uint8_t *out_data;
-    size_t out_len;
-    uint8_t *in_data;
-    size_t in_capacity;
-    size_t *in_len_out;
-    int *status_out;
-    volatile bool *cancel;
-    SemaphoreHandle_t done_sem;     /* pre-allocated, not per-call */
-
-    /* In-flight transfer tracking (for non-blocking operation) */
-    usb_transfer_t *xfer;           /* allocated transfer, NULL when idle */
-    usb_device_handle_t dev_hdl;    /* cached device handle for abort */
-    TickType_t deadline;            /* when the software timeout expires (set when queued) */
-    bool is_control;                /* true = EP0 control transfer */
-    bool is_in;                     /* true = device-to-host */
+    bool is_control;                /* EP0 control transfer */
+    bool is_in;                     /* device-to-host (the data stage, for control) */
     size_t payload_len;             /* requested data length */
-} usb_backend_pipe_req_t;
+    usb_device_handle_t dev_hdl;    /* cached device handle for abort */
+
+    usb_transfer_t *xfer;           /* host transfer, NULL until submitted */
+    bool submitted;                 /* handed to the host library */
+    volatile bool completed;        /* host callback has fired */
+    bool aborted;                   /* cancelled by the caller, or past its deadline */
+    bool cancel_sent;               /* host-library cancel, or halt/flush, requested */
+    TickType_t cancel_tick;         /* when it was requested */
+    bool has_deadline;
+    TickType_t deadline;
+    uint8_t resubmits;              /* resubmissions after a collateral flush */
+} xfer_t;
 
 typedef struct {
     bool in_use;
     bool interfaces_claimed;
+    bool release_pending;           /* session ended with a transfer in flight: release when it is done */
     uint32_t halted_eps;            /* endpoints halted by a STALL (see ep_halt_bit()) */
     usb_device_handle_t dev_hdl;
     usbip_backend_device_t device;
 } usb_backend_device_slot_t;
 
-
 typedef struct {
     SemaphoreHandle_t state_mutex;
-    SemaphoreHandle_t pipe_avail_sem;           /* counting sem: tracks free pipe slots */
     QueueHandle_t event_queue;
     TaskHandle_t task_hdl;
 
-    usb_backend_pipe_req_t pipes[USB_BACKEND_NUM_PIPES];
+    /* Requests waiting to be admitted, oldest first (state_mutex). */
+    usb_backend_req_t *waiting_head;
+    usb_backend_req_t *waiting_tail;
+    uint32_t next_seq;
+    /* Transfers in flight, oldest first.  Written by the backend task only;
+       read by other tasks under state_mutex. */
+    xfer_t *inflight_head;
+    xfer_t *inflight_tail;
+    int num_inflight;
+    int num_in_inflight;            /* bulk/interrupt IN among them */
 
     usb_host_client_handle_t client_hdl;
     usb_backend_device_slot_t devices[CONFIG_USBIP_MAX_DEVICES];
@@ -382,17 +395,6 @@ static int find_free_slot_locked(void)
     return -1;
 }
 
-static int alloc_pipe_locked(void)
-{
-    for (int i = 0; i < USB_BACKEND_NUM_PIPES; i++) {
-        if (!s_state.pipes[i].assigned) {
-            s_state.pipes[i].assigned = true;
-            s_state.pipes[i].active = false;
-            return i;
-        }
-    }
-    return -1;
-}
 
 static void clear_slot_locked(int slot)
 {
@@ -626,19 +628,26 @@ static void remove_gone_device(usb_device_handle_t dev_hdl)
    + HID + MIDI) exhaust them and later claims fail.  The next session claims
    the interfaces again, with fresh pipes at DATA0, on its first non-control
    transfer.  A device with a transfer still in flight keeps its interfaces. */
+static bool busid_in_flight_locked(const char busid[32])
+{
+    for (const xfer_t *x = s_state.inflight_head; x != NULL; x = x->next) {
+        if (busid_matches_key(busid, x->busid)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void release_session_device(const char busid[32])
 {
     xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
     const int slot = find_slot_by_busid_locked(busid);
     if (slot >= 0 && s_state.devices[slot].interfaces_claimed) {
-        bool busy = false;
-        for (int i = 0; i < USB_BACKEND_NUM_PIPES; i++) {
-            if (s_state.pipes[i].submitted && busid_matches_key(busid, s_state.pipes[i].busid)) {
-                busy = true;
-                break;
-            }
-        }
-        if (busy) {
+        if (busid_in_flight_locked(busid)) {
+            /* An orphan (a transfer the device never finished) is still in
+               flight: release once it is retired, unless a new session
+               has started by then. */
+            s_state.devices[slot].release_pending = true;
             ESP_LOGD(TAG, "%s: session ended with a transfer in flight, interfaces kept", busid);
         } else {
             release_interfaces_locked(slot);
@@ -663,6 +672,14 @@ static void process_backend_events(void)
     }
 }
 
+/* Wake the backend task: it blocks in usb_host_client_handle_events(). */
+static void wake_backend(void)
+{
+    if (s_state.client_hdl != NULL) {
+        usb_host_client_unblock(s_state.client_hdl);
+    }
+}
+
 void usb_backend_session_ended(const char busid[32])
 {
     if (busid == NULL || s_state.event_queue == NULL) {
@@ -673,17 +690,17 @@ void usb_backend_session_ended(const char busid[32])
     };
     strlcpy(evt.u.busid, busid, sizeof(evt.u.busid));
     if (xQueueSend(s_state.event_queue, &evt, 0) == pdTRUE) {
-        xTaskNotifyGive(s_state.task_hdl);
+        wake_backend();
     }
 }
 
-/* Completion callback for all transfer types.  The context pointer is
-   the pipe slot, so we just set the completed flag.  The backend task
-   polls this flag to detect completion. */
-static void pipe_transfer_done_cb(usb_transfer_t *transfer)
+/* Completion callback for all transfer types, run inside the backend
+   task's usb_host_client_handle_events(): just flag the transfer, the
+   task finishes it afterwards. */
+static void xfer_done_cb(usb_transfer_t *transfer)
 {
-    usb_backend_pipe_req_t *pipe = (usb_backend_pipe_req_t *)transfer->context;
-    pipe->completed = true;
+    xfer_t *x = (xfer_t *)transfer->context;
+    x->completed = true;
 }
 
 static int map_transfer_status_to_errno(usb_transfer_status_t status)
@@ -766,7 +783,7 @@ static void reset_host_endpoint(usb_device_handle_t dev_hdl, uint8_t endpoint_ad
    tweak_*_cmd()).  Mirror that once the device has accepted the request:
    the device's toggles are back at DATA0, so ours must be too, and an
    endpoint halted by a STALL becomes usable again. */
-static void apply_standard_request_to_host(const usb_backend_pipe_req_t *pipe)
+static void apply_standard_request_to_host(const xfer_t *pipe)
 {
     const usb_setup_packet_t *setup = &pipe->setup;
     const uint8_t std_out = USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_STANDARD;
@@ -832,7 +849,7 @@ static void apply_standard_request_to_host(const usb_backend_pipe_req_t *pipe)
    endpoint fail with -EPIPE meanwhile (as on Linux).  Any other error
    halts the pipe too, but the device is not halted, so the pipe is made
    active again straight away (the toggle is still right). */
-static void note_transfer_failure(const usb_backend_pipe_req_t *pipe, usb_transfer_status_t usb_status)
+static void note_transfer_failure(const xfer_t *pipe, usb_transfer_status_t usb_status)
 {
     if (usb_status == USB_TRANSFER_STATUS_STALL) {
         xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
@@ -847,7 +864,7 @@ static void note_transfer_failure(const usb_backend_pipe_req_t *pipe, usb_transf
     }
 }
 
-static bool endpoint_is_halted(const usb_backend_pipe_req_t *pipe)
+static bool endpoint_is_halted(const xfer_t *pipe)
 {
     xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
     const int dev_slot = find_slot_by_busid_locked(pipe->busid);
@@ -881,19 +898,14 @@ static uint16_t get_endpoint_mps_locked(int dev_slot, uint8_t endpoint_addr)
     return mps;
 }
 
-/* Submit one transfer to the DWC hardware.  Returns 0 on success (transfer
-   is now in-flight; the callback will set pipe->completed).  Returns a
-   negative errno on immediate failure (bad device, no memory, etc.). */
-static int prepare_and_submit_transfer(usb_backend_pipe_req_t *pipe)
+/* Submit one transfer to the host library.  Returns 0 on success (the
+   transfer is in flight; the callback sets completed), -EAGAIN when EP0
+   refused it while being recovered (try again next pass), or another
+   negative errno for an immediate failure (no device, no memory, halted
+   endpoint). */
+static int prepare_and_submit_transfer(xfer_t *pipe)
 {
-    if (pipe->in_len_out != NULL) {
-        *pipe->in_len_out = 0;
-    }
-
-    pipe->is_control = (pipe->endpoint_addr == 0);
-    pipe->is_in = pipe->is_control
-        ? (pipe->setup.bmRequestType & USB_BM_REQUEST_TYPE_DIR_IN) != 0
-        : (pipe->endpoint_addr & 0x80) != 0;
+    const usb_backend_req_t *req = pipe->req;
 
     xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
     const int dev_slot = find_slot_by_busid_locked(pipe->busid);
@@ -913,8 +925,6 @@ static int prepare_and_submit_transfer(usb_backend_pipe_req_t *pipe)
     } else {
         pipe->dev_hdl = NULL;
     }
-
-    pipe->payload_len = pipe->is_in ? pipe->in_capacity : pipe->out_len;
 
     /* For IN bulk/interrupt, round up to MPS while we hold the mutex. */
     size_t xfer_len = pipe->is_control
@@ -943,20 +953,20 @@ static int prepare_and_submit_transfer(usb_backend_pipe_req_t *pipe)
 
     if (pipe->is_control) {
         memcpy(transfer->data_buffer, &pipe->setup, USB_SETUP_PACKET_SIZE);
-        if (!pipe->is_in && pipe->out_len > 0 && pipe->out_data != NULL) {
+        if (!pipe->is_in && req->out_len > 0 && req->out_data != NULL) {
             memcpy(transfer->data_buffer + USB_SETUP_PACKET_SIZE,
-                   pipe->out_data, pipe->out_len);
+                   req->out_data, req->out_len);
         }
-    } else if (!pipe->is_in && pipe->out_len > 0 && pipe->out_data != NULL) {
-        memcpy(transfer->data_buffer, pipe->out_data, pipe->out_len);
+    } else if (!pipe->is_in && req->out_len > 0 && req->out_data != NULL) {
+        memcpy(transfer->data_buffer, req->out_data, req->out_len);
     }
 
-    transfer->callback = pipe_transfer_done_cb;
+    transfer->callback = xfer_done_cb;
     transfer->context = pipe;
     transfer->device_handle = pipe->dev_hdl;
     transfer->bEndpointAddress = pipe->endpoint_addr;
     transfer->num_bytes = xfer_len;
-    transfer->timeout_ms = USB_BACKEND_XFER_TIMEOUT_MS;
+    transfer->timeout_ms = 0;   /* not enforced by the host library; deadlines are ours */
 
     if (pipe->is_control) {
         err = usb_host_transfer_submit_control(s_state.client_hdl, transfer);
@@ -981,34 +991,28 @@ static int prepare_and_submit_transfer(usb_backend_pipe_req_t *pipe)
     pipe->xfer = transfer;
     pipe->submitted = true;
     pipe->completed = false;
-    pipe->aborted = false;
     pipe->cancel_sent = false;
     return 0;
 }
 
-/* Finish a transfer that has completed (callback fired) or was aborted.
-   Reads the hardware result, copies IN data, frees the transfer object,
-   and returns the errno to report to the caller. */
-static int complete_transfer(usb_backend_pipe_req_t *pipe)
+/* Finish a transfer whose callback has fired: read the result, copy IN
+   data to the request, free the host transfer, and return the errno for
+   the caller. */
+static int complete_transfer(xfer_t *pipe, size_t *in_len)
 {
     usb_transfer_t *transfer = pipe->xfer;
-    int status;
+    usb_backend_req_t *req = pipe->req;
+    const int status = map_transfer_status_to_errno(transfer->status);
 
-    if (pipe->completed) {
-        status = map_transfer_status_to_errno(transfer->status);
-    } else {
-        /* Aborted without callback firing (should be rare). */
-        status = -ETIMEDOUT;
-    }
-
+    *in_len = 0;
     if (status != 0) {
         ESP_LOGD(TAG, "transfer failed: usb_status=%d errno=%d (ep=0x%02x)",
                  transfer->status, status, pipe->endpoint_addr);
     }
 
     /* Copy IN data on success. */
-    if (status == 0 && pipe->is_in && pipe->in_data != NULL
-        && pipe->in_capacity > 0) {
+    if (status == 0 && pipe->is_in && req != NULL && req->in_data != NULL
+        && req->in_capacity > 0) {
         size_t bytes;
         if (pipe->is_control) {
             bytes = (transfer->actual_num_bytes > USB_SETUP_PACKET_SIZE)
@@ -1021,16 +1025,12 @@ static int complete_transfer(usb_backend_pipe_req_t *pipe)
             }
         }
         const size_t copy_len =
-            (bytes > pipe->in_capacity) ? pipe->in_capacity : bytes;
+            (bytes > req->in_capacity) ? req->in_capacity : bytes;
         const uint8_t *src = pipe->is_control
             ? (transfer->data_buffer + USB_SETUP_PACKET_SIZE)
             : transfer->data_buffer;
-        memcpy(pipe->in_data, src, copy_len);
-        if (pipe->in_len_out != NULL) {
-            *pipe->in_len_out = copy_len;
-        }
-    } else if (pipe->in_len_out != NULL) {
-        *pipe->in_len_out = 0;
+        memcpy(req->in_data, src, copy_len);
+        *in_len = copy_len;
     }
 
     usb_host_transfer_free(transfer);
@@ -1039,52 +1039,360 @@ static int complete_transfer(usb_backend_pipe_req_t *pipe)
     return status;
 }
 
-/* Answer the caller of an aborted transfer that is still in flight, and
-   keep its slot (and the transfer) until the completion callback fires. */
-static void orphan_transfer(usb_backend_pipe_req_t *pipe)
+static int count_in_on_endpoint_locked(const char busid[32], uint8_t endpoint_addr)
 {
-    const int status = (pipe->cancel != NULL && *pipe->cancel) ? -ECONNRESET : -ETIMEDOUT;
-    ESP_LOGD(TAG, "%s ep 0x%02x: aborted transfer still in flight, holding its slot",
-             pipe->busid, pipe->endpoint_addr);
-
-    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
-    pipe->orphaned = true;
-    xSemaphoreGive(s_state.state_mutex);
-
-    pipe->active = false;
-    if (pipe->status_out != NULL) {
-        *pipe->status_out = status;
+    int n = 0;
+    for (const xfer_t *x = s_state.inflight_head; x != NULL; x = x->next) {
+        if (x->endpoint_addr == endpoint_addr && busid_matches_key(busid, x->busid)) {
+            n++;
+        }
     }
-    /* Everything below belongs to the caller, which returns now. */
-    pipe->status_out = NULL;
-    pipe->in_len_out = NULL;
-    pipe->in_data = NULL;
-    pipe->out_data = NULL;
-    pipe->cancel = NULL;
-    xSemaphoreGive(pipe->done_sem);
+    return n;
 }
 
-/* The orphaned transfer has completed: free it and the slot.  If the caller
-   has not looked at the slot yet, it releases the slot itself. */
-static void release_orphan(usb_backend_pipe_req_t *pipe)
+static void inflight_append_locked(xfer_t *x)
 {
-    usb_host_transfer_free(pipe->xfer);
-    pipe->xfer = NULL;
-    pipe->submitted = false;
-    pipe->completed = false;
-    pipe->aborted = false;
+    x->next = NULL;
+    if (s_state.inflight_tail != NULL) {
+        s_state.inflight_tail->next = x;
+    } else {
+        s_state.inflight_head = x;
+    }
+    s_state.inflight_tail = x;
+    s_state.num_inflight++;
+    if (!x->is_control && x->is_in) {
+        s_state.num_in_inflight++;
+    }
+}
 
-    bool give = false;
+/* Unlink a transfer from the in-flight list.  If its device's USB/IP
+   session ended while the transfer was still in flight (so the session
+   could not release the interfaces, see release_session_device()), release
+   them once the device has no transfer left. */
+static void inflight_remove_locked(xfer_t *x)
+{
+    xfer_t *prev = NULL;
+    for (xfer_t *cur = s_state.inflight_head; cur != NULL; prev = cur, cur = cur->next) {
+        if (cur != x) {
+            continue;
+        }
+        if (prev != NULL) {
+            prev->next = x->next;
+        } else {
+            s_state.inflight_head = x->next;
+        }
+        if (s_state.inflight_tail == x) {
+            s_state.inflight_tail = prev;
+        }
+        s_state.num_inflight--;
+        if (!x->is_control && x->is_in) {
+            s_state.num_in_inflight--;
+        }
+        break;
+    }
+
+    const int slot = find_slot_by_busid_locked(x->busid);
+    if (slot >= 0 && s_state.devices[slot].release_pending && !busid_in_flight_locked(x->busid)) {
+        s_state.devices[slot].release_pending = false;
+        release_interfaces_locked(slot);
+        s_state.devices[slot].halted_eps = 0;
+        ESP_LOGI(TAG, "%s: last transfer retired after its session ended, interfaces released", x->busid);
+    }
+}
+
+/* Retire a transfer (its host transfer already freed) and answer its
+   request, if it still has one. */
+static void finish_xfer(xfer_t *x, int status, size_t in_len)
+{
+    usb_backend_req_t *req = x->req;
+
     xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
-    pipe->orphaned = false;
-    if (pipe->caller_left) {
-        pipe->caller_left = false;
-        pipe->assigned = false;
-        give = true;
+    inflight_remove_locked(x);
+    xSemaphoreGive(s_state.state_mutex);
+    free(x);
+
+    if (req != NULL) {
+        req->done(req, status, in_len);
+    }
+}
+
+typedef struct {
+    usb_device_handle_t dev_hdl;
+    uint8_t endpoint_addr;
+} flushed_ep_t;
+
+/* Ask the host library to retire an aborted transfer.
+   - Control: usb_host_transfer_cancel_control().  A transfer that is only
+     queued is retired alone; one on the bus needs EP0 halted and flushed,
+     which retires every control transfer queued to the device.
+   - Bulk/interrupt: usb_host_transfer_cancel() retires a transfer still
+     queued behind others on its own.  One already in the endpoint's
+     transfer buffers needs the endpoint halted and flushed, which retires
+     every transfer queued on it.
+   Transfers retired as collateral complete as CANCELED without having been
+   aborted; process_inflight() submits them again, in order (Linux keeps
+   the URBs queued behind an unlinked one). */
+static void request_cancel(xfer_t *x, TickType_t now, flushed_ep_t *flushed, int *num_flushed)
+{
+    const char *why = x->req->cancel ? "unlinked" : "timed out";
+
+    if (x->dev_hdl == NULL) {
+        return;
+    }
+    if (x->is_control) {
+        esp_err_t cerr = usb_host_transfer_cancel_control(s_state.client_hdl, x->xfer);
+        if (cerr != ESP_OK && cerr != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "%s: control cancel failed: %s", x->busid, esp_err_to_name(cerr));
+            x->cancel_tick = now - pdMS_TO_TICKS(USB_BACKEND_CANCEL_WAIT_MS);
+        } else {
+            ESP_LOGI(TAG, "%s: control transfer %s, cancelled (bmRequestType 0x%02x bRequest 0x%02x wValue 0x%04x wIndex 0x%04x)",
+                     x->busid, why,
+                     x->setup.bmRequestType, x->setup.bRequest,
+                     x->setup.wValue, x->setup.wIndex);
+        }
+        return;
+    }
+
+    esp_err_t cerr = usb_host_transfer_cancel(x->xfer);
+    if (cerr == ESP_OK || cerr == ESP_ERR_INVALID_STATE) {
+        ESP_LOGD(TAG, "%s ep 0x%02x: %s, retired on its own", x->busid, x->endpoint_addr, why);
+        return;
+    }
+    if (cerr != ESP_ERR_NOT_FINISHED) {
+        ESP_LOGW(TAG, "%s ep 0x%02x: cancel failed: %s", x->busid, x->endpoint_addr, esp_err_to_name(cerr));
+        x->cancel_tick = now - pdMS_TO_TICKS(USB_BACKEND_CANCEL_WAIT_MS);
+        return;
+    }
+    for (int i = 0; i < *num_flushed; i++) {
+        if (flushed[i].dev_hdl == x->dev_hdl && flushed[i].endpoint_addr == x->endpoint_addr) {
+            return;     /* flushed earlier in this pass */
+        }
+    }
+    if (*num_flushed < USB_BACKEND_MAX_FLUSHED_PER_PASS) {
+        flushed[*num_flushed].dev_hdl = x->dev_hdl;
+        flushed[*num_flushed].endpoint_addr = x->endpoint_addr;
+        (*num_flushed)++;
+    }
+    ESP_LOGD(TAG, "%s ep 0x%02x: %s while in flight, halting and flushing the endpoint",
+             x->busid, x->endpoint_addr, why);
+    usb_host_endpoint_halt(x->dev_hdl, x->endpoint_addr);
+    usb_host_endpoint_flush(x->dev_hdl, x->endpoint_addr);
+    usb_host_endpoint_clear(x->dev_hdl, x->endpoint_addr);
+}
+
+/* Completions, cancels and deadlines of the transfers in flight. */
+static void process_inflight(TickType_t now)
+{
+    flushed_ep_t flushed[USB_BACKEND_MAX_FLUSHED_PER_PASS];
+    int num_flushed = 0;
+    xfer_t *next;
+
+    for (xfer_t *x = s_state.inflight_head; x != NULL; x = next) {
+        next = x->next;
+        if (!x->submitted) {
+            continue;       /* submit_pending() runs it */
+        }
+
+        if (x->req == NULL) {
+            /* Orphan: its caller was answered; free the host transfer
+               once the device answers, or it is gone. */
+            if (x->completed) {
+                ESP_LOGD(TAG, "%s ep 0x%02x: orphaned transfer completed (usb_status=%d)",
+                         x->busid, x->endpoint_addr, x->xfer->status);
+                usb_host_transfer_free(x->xfer);
+                x->xfer = NULL;
+                finish_xfer(x, 0, 0);
+            }
+            continue;
+        }
+
+        if (!x->aborted && x->req->cancel) {
+            x->aborted = true;
+            ESP_LOGD(TAG, "transfer cancelled (ep=0x%02x)", x->endpoint_addr);
+        }
+        if (!x->aborted && x->has_deadline && (int32_t)(now - x->deadline) >= 0) {
+            x->aborted = true;
+            ESP_LOGD(TAG, "transfer timed out (ep=0x%02x)", x->endpoint_addr);
+        }
+
+        if (x->aborted && !x->completed) {
+            if (!x->cancel_sent) {
+                x->cancel_sent = true;
+                x->cancel_tick = now;
+                request_cancel(x, now, flushed, &num_flushed);
+            }
+            if ((now - x->cancel_tick) < pdMS_TO_TICKS(USB_BACKEND_CANCEL_WAIT_MS)) {
+                continue;
+            }
+            /* Still in flight after the cancel: answer the caller now and
+               keep the host transfer until it really completes (freeing it
+               earlier lets the stack write into freed heap). */
+            ESP_LOGW(TAG, "%s ep 0x%02x: cancelled transfer did not complete, holding its host transfer",
+                     x->busid, x->endpoint_addr);
+            usb_backend_req_t *req = x->req;
+            x->req = NULL;
+            req->done(req, req->cancel ? -ECONNRESET : -ETIMEDOUT, 0);
+            continue;
+        }
+
+        if (!x->completed) {
+            continue;
+        }
+
+        const usb_transfer_status_t usb_status = x->xfer->status;
+        if (usb_status == USB_TRANSFER_STATUS_CANCELED && !x->aborted) {
+            if (x->req->cancel) {
+                /* Its own cancel arrived meanwhile: no need to run it again. */
+                x->aborted = true;
+            } else if (x->resubmits < USB_BACKEND_MAX_RESUBMITS) {
+                /* Retired by a halt/flush it did not ask for: submit it
+                   again, as Linux keeps URBs queued behind an unlinked or
+                   failed one. */
+                x->resubmits++;
+                ESP_LOGD(TAG, "%s ep 0x%02x: transfer retired by a flush, resubmitting (%u)",
+                         x->busid, x->endpoint_addr, x->resubmits);
+                usb_host_transfer_free(x->xfer);
+                x->xfer = NULL;
+                x->completed = false;
+                x->submitted = false;   /* submit_pending() runs it, in order */
+                continue;
+            }
+        }
+
+        size_t in_len = 0;
+        int status = complete_transfer(x, &in_len);
+
+        if (x->aborted && usb_status == USB_TRANSFER_STATUS_CANCELED) {
+            /* We forced the abort (unless the transfer finished on its own
+               before it took effect). */
+            status = x->req->cancel ? -ECONNRESET : -ETIMEDOUT;
+            in_len = 0;
+        } else if (x->is_control) {
+            if (status == 0) {
+                apply_standard_request_to_host(x);
+            }
+        } else if (status != 0 && x->dev_hdl != NULL) {
+            note_transfer_failure(x, usb_status);
+            /* URBs queued behind a STALL are flushed by the host library;
+               they failed because the endpoint halted. */
+            if (usb_status == USB_TRANSFER_STATUS_CANCELED && endpoint_is_halted(x)) {
+                status = -EPIPE;
+            }
+        }
+
+        finish_xfer(x, status, in_len);
+    }
+}
+
+/* Move waiting requests into flight, oldest first.  A request cancelled
+   while waiting is answered here.  Reads (bulk/interrupt IN) are held back
+   while their endpoint, or reads as a whole, hold their share; requests
+   for other endpoints go ahead of them, so pending reads never delay OUT
+   data or control requests. */
+static void admit_waiting(TickType_t now)
+{
+    usb_backend_req_t *answer = NULL;      /* cancelled or failed while waiting */
+
+    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+    usb_backend_req_t *prev = NULL;
+    usb_backend_req_t *req = s_state.waiting_head;
+    while (req != NULL) {
+        usb_backend_req_t *next = req->next;
+        const bool is_control = req->endpoint_addr == 0;
+        const bool is_in = is_control
+            ? (req->setup.bmRequestType & USB_BM_REQUEST_TYPE_DIR_IN) != 0
+            : (req->endpoint_addr & 0x80) != 0;
+        xfer_t *x = NULL;
+        int fail = 0;
+
+        if (req->cancel) {
+            fail = -ECONNRESET;
+        } else if (s_state.num_inflight >= USB_BACKEND_MAX_INFLIGHT) {
+            break;      /* nothing behind can go either; keeps the order */
+        } else if (!is_control && is_in
+                   && (s_state.num_in_inflight >= USB_BACKEND_MAX_IN_INFLIGHT
+                       || count_in_on_endpoint_locked(req->busid, req->endpoint_addr)
+                          >= USB_BACKEND_MAX_IN_PER_EP)) {
+            prev = req;
+            req = next;
+            continue;
+        } else {
+            x = calloc(1, sizeof(*x));
+            if (x == NULL) {
+                fail = -ENOMEM;
+            }
+        }
+
+        /* Unlink the request from the waiting queue. */
+        if (prev != NULL) {
+            prev->next = next;
+        } else {
+            s_state.waiting_head = next;
+        }
+        if (s_state.waiting_tail == req) {
+            s_state.waiting_tail = prev;
+        }
+
+        if (x == NULL) {
+            req->status = fail;
+            req->next = answer;
+            answer = req;
+        } else {
+            x->req = req;
+            x->seq = req->seq;
+            memcpy(x->busid, req->busid, sizeof(x->busid));
+            x->endpoint_addr = req->endpoint_addr;
+            x->setup = req->setup;
+            x->is_control = is_control;
+            x->is_in = is_in;
+            x->payload_len = is_in ? req->in_capacity : req->out_len;
+            if (is_control && USB_BACKEND_CTRL_TIMEOUT_MS > 0) {
+                x->has_deadline = true;
+                x->deadline = now + pdMS_TO_TICKS(USB_BACKEND_CTRL_TIMEOUT_MS);
+            }
+            inflight_append_locked(x);
+            /* The device is in use again: do not release its interfaces
+               under this session when an old orphan retires. */
+            const int slot = find_slot_by_busid_locked(req->busid);
+            if (slot >= 0) {
+                s_state.devices[slot].release_pending = false;
+            }
+        }
+        req = next;
     }
     xSemaphoreGive(s_state.state_mutex);
-    if (give) {
-        xSemaphoreGive(s_state.pipe_avail_sem);
+
+    while (answer != NULL) {
+        usb_backend_req_t *done = answer;
+        answer = done->next;
+        done->done(done, done->status, 0);
+    }
+}
+
+/* Hand new and resubmitted transfers to the host library, in order. */
+static void submit_pending(void)
+{
+    xfer_t *next;
+
+    for (xfer_t *x = s_state.inflight_head; x != NULL; x = next) {
+        next = x->next;
+        if (x->submitted || x->req == NULL) {
+            continue;
+        }
+        int ret = prepare_and_submit_transfer(x);
+        if (ret == -EAGAIN) {
+            /* EP0 is being recovered: try again on the next pass. */
+            if (x->req->cancel) {
+                ret = -ECONNRESET;
+            } else if (x->has_deadline && (int32_t)(xTaskGetTickCount() - x->deadline) >= 0) {
+                ret = -ETIMEDOUT;
+            } else {
+                continue;
+            }
+        }
+        if (ret < 0) {
+            finish_xfer(x, ret, 0);
+        }
     }
 }
 
@@ -1126,16 +1434,15 @@ static void usb_backend_task(void *arg)
         return;
     }
 
-    ESP_LOGD(TAG, "USB backend task running (%d pipe slots)", USB_BACKEND_NUM_PIPES);
+    ESP_LOGD(TAG, "USB backend task running (up to %d transfers in flight, %d reads per endpoint)",
+             USB_BACKEND_MAX_INFLIGHT, USB_BACKEND_MAX_IN_PER_EP);
 
     while (true) {
-        /* Wait for a notification from a caller, or wake every 10ms to
-           poll timeouts. */
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
-
-        /* Pump USB events — this also delivers transfer completion
-           callbacks (pipe->completed = true). */
-        err = usb_host_client_handle_events(s_state.client_hdl, 0);
+        /* Blocks until a transfer completes or a device event arrives
+           (usb_backend_submit() and usb_backend_cancel() unblock it too),
+           for at most the poll period.  Completion callbacks run in here
+           and set xfer->completed. */
+        err = usb_host_client_handle_events(s_state.client_hdl, pdMS_TO_TICKS(USB_BACKEND_POLL_MS));
         if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
             ESP_LOGD(TAG, "usb_host_client_handle_events failed: %s", esp_err_to_name(err));
         }
@@ -1143,171 +1450,9 @@ static void usb_backend_task(void *arg)
         process_backend_events();
 
         const TickType_t now = xTaskGetTickCount();
-
-        /* Phase 1: Submit any newly-active pipes to the DWC hardware.
-           These transfers now run concurrently in hardware. */
-        for (int i = 0; i < USB_BACKEND_NUM_PIPES; i++) {
-            usb_backend_pipe_req_t *pipe = &s_state.pipes[i];
-            if (!pipe->active || pipe->submitted) {
-                continue;
-            }
-
-            int ret = prepare_and_submit_transfer(pipe);
-            if (ret == -EAGAIN) {
-                /* EP0 is being recovered: try again on the next pass. */
-                if (pipe->cancel != NULL && *pipe->cancel) {
-                    ret = -ECONNRESET;
-                } else if (now >= pipe->deadline) {
-                    ret = -ETIMEDOUT;
-                } else {
-                    continue;
-                }
-            }
-            if (ret < 0) {
-                /* Immediate failure (bad device, no memory, etc.) —
-                   complete the request now. */
-                pipe->active = false;
-                if (pipe->status_out != NULL) {
-                    *pipe->status_out = ret;
-                }
-                xSemaphoreGive(pipe->done_sem);
-            }
-        }
-
-        /* Phase 2: Check all in-flight transfers for completion,
-           timeout, or cancellation. */
-        for (int i = 0; i < USB_BACKEND_NUM_PIPES; i++) {
-            usb_backend_pipe_req_t *pipe = &s_state.pipes[i];
-            if (!pipe->submitted) {
-                continue;
-            }
-            if (pipe->orphaned) {
-                if (pipe->completed) {
-                    release_orphan(pipe);
-                }
-                continue;
-            }
-
-            /* Detect external cancel requests. */
-            if (!pipe->aborted && pipe->cancel != NULL && *pipe->cancel) {
-                pipe->aborted = true;
-                ESP_LOGD(TAG, "transfer cancelled (ep=0x%02x)", pipe->endpoint_addr);
-            }
-
-            /* Detect software timeout (DWC hardware doesn't). */
-            if (!pipe->aborted && now >= pipe->deadline) {
-                pipe->aborted = true;
-                ESP_LOGD(TAG, "transfer timed out (ep=0x%02x)", pipe->endpoint_addr);
-            }
-
-            /* If we need to abort a non-control transfer that hasn't
-               completed yet, halt+flush the endpoint to force the DWC
-               hardware to fire the completion callback. */
-            if (pipe->aborted && !pipe->completed && !pipe->is_control
-                && pipe->dev_hdl != NULL) {
-                usb_host_endpoint_halt(pipe->dev_hdl, pipe->endpoint_addr);
-                usb_host_endpoint_flush(pipe->dev_hdl, pipe->endpoint_addr);
-                /* Pump events so the flush/halt callback fires. */
-                for (int j = 0; j < 50 && !pipe->completed; j++) {
-                    usb_host_client_handle_events(s_state.client_hdl,
-                                                  pdMS_TO_TICKS(10));
-                }
-                usb_host_endpoint_clear(pipe->dev_hdl, pipe->endpoint_addr);
-            }
-
-            /* Cancel an aborted control transfer: the host library retires
-               it (and, if it was on the bus, every control transfer queued
-               to the device; see the resubmission below) and calls back
-               with USB_TRANSFER_STATUS_CANCELED.  Without this, a transfer
-               the device never finishes blocks the device's EP0 for good:
-               every later control transfer queues behind it.  Wait for the
-               callback on later passes. */
-            if (pipe->aborted && !pipe->completed && pipe->is_control
-                && pipe->dev_hdl != NULL) {
-                if (!pipe->cancel_sent) {
-                    pipe->cancel_sent = true;
-                    pipe->cancel_tick = now;
-                    esp_err_t cerr = usb_host_transfer_cancel_control(s_state.client_hdl, pipe->xfer);
-                    if (cerr != ESP_OK && cerr != ESP_ERR_INVALID_STATE) {
-                        ESP_LOGW(TAG, "%s: control cancel failed: %s", pipe->busid, esp_err_to_name(cerr));
-                        pipe->cancel_tick = now - pdMS_TO_TICKS(USB_BACKEND_CANCEL_WAIT_MS);
-                    } else {
-                        ESP_LOGI(TAG, "%s: control transfer %s, cancelled (bmRequestType 0x%02x bRequest 0x%02x wValue 0x%04x wIndex 0x%04x)",
-                                 pipe->busid,
-                                 (pipe->cancel != NULL && *pipe->cancel) ? "unlinked" : "timed out",
-                                 pipe->setup.bmRequestType, pipe->setup.bRequest,
-                                 pipe->setup.wValue, pipe->setup.wIndex);
-                    }
-                }
-                if ((now - pipe->cancel_tick) < pdMS_TO_TICKS(USB_BACKEND_CANCEL_WAIT_MS)) {
-                    continue;
-                }
-                ESP_LOGW(TAG, "%s: cancelled control transfer did not complete, holding its slot",
-                         pipe->busid);
-            }
-
-            /* An aborted transfer may still be in flight after the halt/flush
-               or cancel above.  Freeing it then lets the stack write into
-               freed heap, so answer the caller now and hold the slot until
-               the transfer really completes (the device answers, or is
-               gone). */
-            if (pipe->aborted && !pipe->completed) {
-                orphan_transfer(pipe);
-                continue;
-            }
-
-            /* A control transfer retired by an EP0 flush it did not ask for
-               (another transfer's cancel, or an EP0 error on another
-               transfer) never ran to completion: submit it again, as Linux
-               keeps URBs queued behind an unlinked or failed one. */
-            if (pipe->completed && !pipe->aborted && pipe->is_control
-                && pipe->xfer->status == USB_TRANSFER_STATUS_CANCELED
-                && pipe->resubmits < USB_BACKEND_MAX_CTRL_RESUBMITS) {
-                pipe->resubmits++;
-                ESP_LOGD(TAG, "%s: control transfer retired by an EP0 flush, resubmitting (%u)",
-                         pipe->busid, pipe->resubmits);
-                usb_host_transfer_free(pipe->xfer);
-                pipe->xfer = NULL;
-                pipe->completed = false;
-                pipe->submitted = false;   /* Phase 1 submits it again */
-                continue;
-            }
-
-            /* If the transfer has completed (callback fired) or we've
-               aborted it, finalise and signal the waiting caller. */
-            if (pipe->completed || pipe->aborted) {
-                const usb_transfer_status_t usb_status =
-                    pipe->completed ? pipe->xfer->status : USB_TRANSFER_STATUS_TIMED_OUT;
-                int status = complete_transfer(pipe);
-
-                /* If we forced the abort, override the hardware status
-                   with the appropriate errno, unless the transfer finished
-                   on its own before the abort took effect. */
-                if (pipe->aborted && (!pipe->completed || usb_status == USB_TRANSFER_STATUS_CANCELED)) {
-                    status = (pipe->cancel != NULL && *pipe->cancel)
-                                 ? -ECONNRESET
-                                 : -ETIMEDOUT;
-                } else if (pipe->is_control) {
-                    if (status == 0) {
-                        apply_standard_request_to_host(pipe);
-                    }
-                } else if (status != 0 && pipe->dev_hdl != NULL) {
-                    note_transfer_failure(pipe, usb_status);
-                    /* URBs queued behind a STALL are flushed by the host
-                       library; they failed because the endpoint halted. */
-                    if (usb_status == USB_TRANSFER_STATUS_CANCELED && endpoint_is_halted(pipe)) {
-                        status = -EPIPE;
-                    }
-                }
-
-                pipe->active = false;
-                pipe->submitted = false;
-                if (pipe->status_out != NULL) {
-                    *pipe->status_out = status;
-                }
-                xSemaphoreGive(pipe->done_sem);
-            }
-        }
+        process_inflight(now);
+        admit_waiting(now);
+        submit_pending();
     }
 }
 
@@ -1332,22 +1477,6 @@ esp_err_t usb_backend_start(void)
     s_state.state_mutex = xSemaphoreCreateMutex();
     if (s_state.state_mutex == NULL) {
         return ESP_ERR_NO_MEM;
-    }
-
-    /* Counting semaphore to limit concurrent in-flight transfers to the
-       number of hardware host channels. */
-    s_state.pipe_avail_sem = xSemaphoreCreateCounting(USB_BACKEND_NUM_PIPES, 0);
-    if (s_state.pipe_avail_sem == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    /* Release all slots into the pool. */
-    for (int i = 0; i < USB_BACKEND_NUM_PIPES; i++) {
-        s_state.pipes[i].done_sem = xSemaphoreCreateBinary();
-        if (s_state.pipes[i].done_sem == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-        xSemaphoreGive(s_state.pipe_avail_sem);
     }
 
     s_state.event_queue = xQueueCreate(USB_BACKEND_EVENT_QUEUE_LEN, sizeof(usb_backend_event_t));
@@ -1499,160 +1628,34 @@ bool usb_backend_get_device_by_busid(const char busid[32], usbip_backend_device_
     return found;
 }
 
-/* Reserve a free pipe slot, fill it with the caller's parameters,
-   wake the backend task, and wait for completion.  Each URB gets its
-   own dynamically-allocated slot — concurrent URBs on the same
-   endpoint no longer collide. */
-static int submit_pipe_request(const char busid[32],
-                               uint8_t endpoint_addr,
-                               const usb_setup_packet_t *setup,
-                               const uint8_t *out_data,
-                               size_t out_len,
-                               uint8_t *in_data,
-                               size_t in_capacity,
-                               size_t *in_len,
-                               volatile bool *cancel)
+void usb_backend_submit(usb_backend_req_t *req)
 {
-    if (busid == NULL || in_len == NULL) {
-        return -EINVAL;
+    if (req == NULL || req->done == NULL) {
+        return;
     }
 
-    *in_len = 0;
-
-    /* Wait for a free host channel from the shared pool. */
-    xSemaphoreTake(s_state.pipe_avail_sem, portMAX_DELAY);
-
-    /* Allocate a specific slot under the mutex. */
+    req->next = NULL;
+    req->status = 0;
     xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
-
-    const int dev_slot = find_slot_by_busid_locked(busid);
-    if (dev_slot < 0) {
-        xSemaphoreGive(s_state.state_mutex);
-        xSemaphoreGive(s_state.pipe_avail_sem);
-        return -ENODEV;
-    }
-
-    /* Verify the endpoint exists (non-EP0 only). */
-    if (endpoint_addr != 0) {
-        const usbip_backend_device_t *device = &s_state.devices[dev_slot].device;
-        bool found = false;
-        for (uint8_t i = 0; i < device->num_endpoints; i++) {
-            if (device->endpoints[i].address == endpoint_addr) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            xSemaphoreGive(s_state.state_mutex);
-            xSemaphoreGive(s_state.pipe_avail_sem);
-            ESP_LOGD(TAG, "Unknown endpoint 0x%02x on %s", endpoint_addr, busid);
-            return -ENODEV;
-        }
-    }
-
-    const int pipe_idx = alloc_pipe_locked();
-    xSemaphoreGive(s_state.state_mutex);
-
-    if (pipe_idx < 0) {
-        /* Should never happen if the counting semaphore is correct. */
-        xSemaphoreGive(s_state.pipe_avail_sem);
-        ESP_LOGE(TAG, "No free pipe slot (semaphore accounting error)");
-        return -EBUSY;
-    }
-
-    usb_backend_pipe_req_t *pipe = &s_state.pipes[pipe_idx];
-
-    int status = -EIO;
-
-    memcpy(pipe->busid, busid, sizeof(pipe->busid));
-    pipe->endpoint_addr = endpoint_addr;
-    if (setup != NULL) {
-        pipe->setup = *setup;
-    }
-    pipe->out_data = out_data;
-    pipe->out_len = out_len;
-    pipe->in_data = in_data;
-    pipe->in_capacity = in_capacity;
-    pipe->in_len_out = in_len;
-    pipe->status_out = &status;
-    pipe->cancel = cancel;
-    pipe->resubmits = 0;
-    pipe->cancel_sent = false;
-    pipe->deadline = xTaskGetTickCount() + pdMS_TO_TICKS(USB_BACKEND_XFER_TIMEOUT_MS);
-
-    /* Mark active and wake the backend task. */
-    pipe->active = true;
-    xTaskNotifyGive(s_state.task_hdl);
-
-    /* Wait for the backend task to process this slot. */
-    xSemaphoreTake(pipe->done_sem, portMAX_DELAY);
-
-    /* Return the pipe slot to the shared pool.  Only clear assigned;
-       active/submitted are owned by the backend task.  An orphaned slot
-       (aborted, transfer still in flight) is released by the backend task
-       once the transfer completes. */
-    bool give = true;
-    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
-    if (pipe->orphaned) {
-        pipe->caller_left = true;
-        give = false;
+    req->seq = s_state.next_seq++;
+    if (s_state.waiting_tail != NULL) {
+        s_state.waiting_tail->next = req;
     } else {
-        pipe->assigned = false;
+        s_state.waiting_head = req;
     }
+    s_state.waiting_tail = req;
     xSemaphoreGive(s_state.state_mutex);
-    if (give) {
-        xSemaphoreGive(s_state.pipe_avail_sem);
+
+    wake_backend();
+}
+
+void usb_backend_cancel(usb_backend_req_t *req)
+{
+    if (req == NULL) {
+        return;
     }
-
-    return status;
-}
-
-int usb_backend_control_transfer(const char busid[32],
-                                 const usb_setup_packet_t *setup,
-                                 const uint8_t *out_data,
-                                 size_t out_len,
-                                 uint8_t *in_data,
-                                 size_t in_capacity,
-                                 size_t *in_len,
-                                 volatile bool *cancel)
-{
-    if (setup == NULL) {
-        return -EINVAL;
-    }
-    return submit_pipe_request(busid, 0, setup,
-                               out_data, out_len,
-                               in_data, in_capacity, in_len,
-                               cancel);
-}
-
-int usb_backend_bulk_transfer(const char busid[32],
-                              uint8_t endpoint_addr,
-                              const uint8_t *out_data,
-                              size_t out_len,
-                              uint8_t *in_data,
-                              size_t in_capacity,
-                              size_t *in_len,
-                              volatile bool *cancel)
-{
-    return submit_pipe_request(busid, endpoint_addr, NULL,
-                               out_data, out_len,
-                               in_data, in_capacity, in_len,
-                               cancel);
-}
-
-int usb_backend_interrupt_transfer(const char busid[32],
-                                   uint8_t endpoint_addr,
-                                   const uint8_t *out_data,
-                                   size_t out_len,
-                                   uint8_t *in_data,
-                                   size_t in_capacity,
-                                   size_t *in_len,
-                                   volatile bool *cancel)
-{
-    return submit_pipe_request(busid, endpoint_addr, NULL,
-                               out_data, out_len,
-                               in_data, in_capacity, in_len,
-                               cancel);
+    req->cancel = true;
+    wake_backend();
 }
 
 bool usb_backend_is_interrupt_endpoint(const char busid[32], uint8_t ep_num, uint8_t direction)

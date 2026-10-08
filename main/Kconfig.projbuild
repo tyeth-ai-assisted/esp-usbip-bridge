@@ -331,14 +331,50 @@ config USBIP_MAX_DEVICES
         Maximum number of simultaneously exported non-hub USB devices.
         Increase this when using downstream hubs with multiple peripherals.
 
-config USBIP_NUM_PIPES
-    int "Number of USB host pipe request slots"
-    default 16 if IDF_TARGET_ESP32P4 || IDF_TARGET_ESP32S31
+config USBIP_MAX_INFLIGHT_XFERS
+    int "Maximum transfers in flight at the USB host"
+    range 16 512
+    default 128 if IDF_TARGET_ESP32P4 || IDF_TARGET_ESP32S31
+    default 64
+    help
+        Transfers handed to the USB host library at the same time, over all
+        devices and endpoints. Transfers queue on their endpoint's pipe, so
+        this is not bound by the controller's channel count; it bounds the
+        DMA memory in use (one buffer of up to USBIP_MAX_TRANSFER bytes each).
+        Bulk and interrupt IN transfers (reads) may hold all but 8 of them,
+        so pending reads can never starve OUT data or control requests.
+
+config USBIP_MAX_IN_XFERS_PER_ENDPOINT
+    int "Pending IN transfers per endpoint"
+    range 1 64
     default 8
     help
-        Number of concurrent USB transfer request slots.  Should match the
-        DWC host controller channel count (16 for ESP32-P4 and ESP32-S31,
-        8 for ESP32-S3).
+        Reads in flight on one bulk or interrupt IN endpoint; further reads
+        wait in the backend's queue until one of them completes. Reads are
+        not timed out (as on a Linux host): they stay pending until the
+        device sends data, the client unlinks them, or the device is gone.
+        Linux cdc-acm keeps 16 reads pending per port, usb-serial 2 to 4.
+
+config USBIP_CTRL_XFER_TIMEOUT_MS
+    int "Control transfer deadline (ms, 0 = none)"
+    range 0 60000
+    default 5000
+    help
+        A control transfer the device has not finished within this time is
+        cancelled and answered with -ETIMEDOUT (the host library does not
+        enforce a timeout). Linux's own usb_control_msg() timeout usually
+        unlinks the URB first. Bulk and interrupt transfers have no deadline.
+
+config USBIP_MAX_INFLIGHT_URBS
+    int "Maximum URBs in flight per USB/IP connection"
+    range 8 512
+    default 64
+    help
+        URBs accepted from one client connection before the reader waits
+        for a reply to go out. Each one holds its data (up to
+        USBIP_MAX_URB_SIZE bytes); nothing else is per URB, as no task
+        blocks on a transfer. Linux keeps up to 33 URBs pending on an idle
+        cdc-acm port (16 reads, 16 writes and the notification read).
 
 config USBIP_NEOPIXEL_GPIO
     int "Neopixel data GPIO"

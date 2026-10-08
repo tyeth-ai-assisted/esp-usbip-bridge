@@ -57,7 +57,8 @@ fi
 echo "CAUGHT"
 echo "$out" | grep -E "Chip type|Features|Crystal|MAC|Manufacturer|Device|flash size"
 "$ESPTOOL" -p "$DEV" --before no-reset --after no-reset read-flash 0x8000 0xc00 "$W/pt.bin" >/dev/null 2>&1
-python3 - "$W/pt.bin" "$W/app_off" <<'PY'
+"$ESPTOOL" -p "$DEV" --before no-reset --after no-reset read-flash 0x0 0x40 "$W/boot.bin" >/dev/null 2>&1
+python3 - "$W/pt.bin" "$W/app_off" "$W/boot.bin" <<'PY'
 import struct, sys
 d = open(sys.argv[1], "rb").read(); app = None
 for i in range(0, len(d), 32):
@@ -69,6 +70,12 @@ for i in range(0, len(d), 32):
     print(f"  {name:16s} type={typ} sub=0x{sub:02x} off=0x{off:x} size=0x{size:x}")
     if typ == 0 and app is None:
         app = off
+if app is None:
+    # No partition table: show what is there (0xff = erased flash, so the ROM
+    # finds no bootloader and its watchdog resets the chip over and over)
+    b = open(sys.argv[3], "rb").read() if len(sys.argv) > 3 else b""
+    print("  no partition table at 0x8000:", d[:16].hex(), "...", "erased" if d and set(d) == {0xff} else "data")
+    print("  bootloader region 0x0  :", b[:16].hex(), "...", "erased" if b and set(b) == {0xff} else ("ESP image magic" if b[:1] == b"\xe9" else "data"))
 open(sys.argv[2], "w").write(hex(app or 0x10000))
 PY
 "$ESPTOOL" -p "$DEV" --before no-reset --after no-reset read-flash "$(cat "$W/app_off")" 0x100 "$W/app.bin" >/dev/null 2>&1

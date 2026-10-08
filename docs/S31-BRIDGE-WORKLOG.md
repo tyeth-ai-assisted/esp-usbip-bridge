@@ -260,3 +260,75 @@ Bench notes:
   - bridge #19: idle IN reads hold slots, and the 8-in-flight cap lets them starve OUT and control. This is what stops esptool syncing with the `1-1.1.2` DUT in its ROM loader. Needs a decision.
   - sbc-mcu-dut-controller#6: DUT not identified yet.
   - The QT Py at `1-1.2` (WipperSnapper) reboots itself every few minutes. That's normal for it, and it occasionally makes the mass-storage test flaky.
+
+## 12. 2026-10-08 evening: pending reads without deadlines, task-free URB path (bridge #19)
+
+### The problem
+
+Linux keeps bulk/interrupt IN URBs pending for ever (cdc-acm: 16 reads per port). The bridge gave every transfer a 5 s deadline, held each pending read in a worker task and a pool slot, let a connection have only 8 URBs in flight, and aborted a timed-out read by halting and flushing its endpoint, which cancelled the sibling reads as `-ECONNRESET` (cdc-acm then stops resubmitting them). Measured on the old image (`2f12b2d`): a pyserial open of an idle cdc-acm port took 9 to 18 s, an idle console stopped answering after 20 s, and esptool could not catch the `1-1.1.2` DUT's ROM loader in 60 s.
+
+### Options compared
+
+| | 1. raise limits (48 URBs, 64 slots, PSRAM stacks) | 2. reserve slots for OUT/control | 3. no IN deadline + task-free backend (shipped) |
+|---|---|---|---|
+| serial open | fast while reads complete | fast | fast |
+| idle reads | still time out at 5 s; siblings still `-ECONNRESET` | same | never time out; one read is cancelled on its own |
+| memory per pending read | 8 KiB task stack (PSRAM on the S31, internal RAM elsewhere) | 8 KiB task stack | about 0.5 KiB (request + buffer) |
+| boards without PSRAM | 16 pending reads = 128 KiB | same | fine |
+| esptool on an idle ROM loader | works while the pool is not full | works | works |
+
+Options 1 and 2 both keep the two defects behind #19 (the deadline and the sibling cancel) and both make a pending read cost a task. Option 3 removes the task, so the limits can be generous everywhere, and matches Linux semantics. Measurements are in #19.
+
+### What changed
+
+- **esp-usb `a391e1f`** (`hub-port-power`): `usb_host_transfer_cancel()` retires one queued bulk/interrupt transfer (`hcd_urb_cancel_pending()` on the endpoint's pipe, then the endpoint callback). A transfer already in one of the pipe's two DMA buffers reports `ESP_ERR_NOT_FINISHED`; only those need a halt/flush.
+- **Backend** (`main/usb_backend.c`): the blocking `usb_backend_*_transfer()` calls are gone. `usb_backend_submit(req)` queues a `usb_backend_req_t`; the backend task admits requests into an in-flight list in order, submits them, and calls `req->done()` from its own task. `usb_backend_cancel(req)` retires a waiting or in-flight request. Rules:
+  - bulk/interrupt transfers have **no deadline**; control transfers keep one (`CONFIG_USBIP_CTRL_XFER_TIMEOUT_MS`, 5000, 0 = none);
+  - at most `CONFIG_USBIP_MAX_IN_XFERS_PER_ENDPOINT` (8) reads in flight per IN endpoint, the rest wait in the queue; reads as a whole leave 8 of `CONFIG_USBIP_MAX_INFLIGHT_XFERS` (128 on P4/S31, 64 elsewhere) free for OUT and control, so a read can never delay them;
+  - a cancelled read that is only queued is retired alone; one in flight gets its endpoint halted and flushed, and the sibling transfers that completed as `CANCELED` without being cancelled are **submitted again in order** (up to 8 times) instead of being reported `-ECONNRESET`;
+  - orphaning (#17) stays as the last resort after a 1 s cancel wait; when an orphan finally retires after its session ended, the device's interfaces are released then (`release_pending`), closing a gap in #20;
+  - the task blocks in `usb_host_client_handle_events()` and is woken by `usb_host_client_unblock()` on submit/cancel, so completions are processed at once instead of on the 10 ms poll.
+- **Server** (`main/usbip_server.c`): one reader (the connection task) and one **writer task** per connection; no task per URB. The reader validates, reads OUT data and submits; the backend's completion queues the URB for the writer, which sends `RET_SUBMIT`/`RET_UNLINK` and frees it. Large bulk URBs chain their segments from the completion callback. `CONFIG_USBIP_MAX_INFLIGHT_URBS` (64) bounds memory per connection; `CMD_UNLINK` now also cancels the backend request.
+- **Kconfig:** `USBIP_NUM_PIPES` removed (its "match the channel count" rationale was wrong: transfers queue on their endpoint's pipe, channels are per endpoint); the four options above added. `sdkconfig.s31-function-coreboard-1.example` refreshed.
+- **Bench:** `regression.sh` gained `open` (serial open under 1 s on `1-1.4` and `1-1.1.1`), `idle` (25 s + 10 s idle on `1-1.1.1`, cdc-acm dynamic debug counts failed reads, console still answers) and the `timeout` test now expects libusb's own 20 s timeout (`-7`) with no `-110`, then a working console. `lib.sh`: `tty_of` waits for the driver, `console_probe`, `serial_open_times`, `acm_debug_on`. `idf-s31.ps1` finds its own checkout.
+
+### Review of the earlier timeout and signalling changes
+
+Asked for by the user. Each item says what it did, whether it survives, and why.
+
+| Change | Kept? | Notes |
+|---|---|---|
+| 5 s software deadline on every transfer (inherited) | control only | Linux has no HCD deadline; `usb_control_msg()` callers unlink at 5 s themselves, so the bridge's control deadline is a safety net for clients that never unlink. Bulk/interrupt deadlines were the cause of #19. |
+| Abort by halt + flush of the endpoint, 50 x 10 ms inline pump (inherited) | replaced | Now a per-URB cancel first; a flush only for an in-flight read, one per endpoint per pass, no inline pumping (the callbacks arrive on the next `handle_events`). Siblings are resubmitted, not failed. |
+| #14 Linux errno mapping | kept | Unchanged. |
+| #15 `CMD_UNLINK` answered with `RET_UNLINK(-ECONNRESET)` instead of `RET_SUBMIT`; `RET_UNLINK(0)` when already answered | kept | The writer frees the slot under `write_mutex`, same invariant. The unlink now reaches the backend as a cancel at once instead of being polled from a flag. |
+| #13 STALL leaves the endpoint halted (`-EPIPE`); `CLEAR_FEATURE`/`SET_INTERFACE`/`SET_CONFIGURATION` reset host toggles | kept | A sibling flushed by a STALL is resubmitted and refused with `-EPIPE` by the halted check, same result as before. |
+| #17 orphaning of aborted transfers still in flight | kept as fallback | Still needed: a bulk OUT the device NAKs for ever cannot be retired until the halt completes. The orphan now also triggers the deferred interface release. |
+| #18 segmented bulk URBs | kept | Segments chain from the completion callback; a cancel between segments ends the URB with `-ECONNRESET` as before. |
+| #20 interface release at session end | kept and fixed | Release was skipped when an orphan was still in flight and never retried; now deferred to the orphan's retirement, and dropped if a new session starts. |
+| #21 EP0 cancel, `-EAGAIN` retry while EP0 recovers, collateral resubmit (3x) | kept | Shares the generic resubmit path (limit 8). The retry ends at the control deadline. |
+| Pool of 16 "pipe" slots guarded by a counting semaphore | replaced | Workers blocked on the semaphore; now an ordered queue in the backend, admission by share. |
+| 8 URBs in flight per connection, 50 ms polling for a slot | replaced | 64 (Kconfig), a counting semaphore the writer gives. |
+| Worker task per URB (8 KiB) | removed | Reader + writer per connection. |
+| Backend event queue 16, 10 ms poll | kept | Completions and submits wake the task; the poll only serves deadlines and cancel waits. |
+| 5 s wait for workers at session end | kept | Now waits for the backend to answer the cancelled URBs; orphans are answered within the 1 s cancel wait. |
+
+Still worth a look (filed as an issue): no TCP keepalive on the URB stream, so a client that vanishes without a FIN keeps the device and its interfaces claimed until the socket errors.
+
+Baseline on the old image `2f12b2d` with the new tests (`regression.sh open idle timeout`): opens 16.9 s (`1-1.4`) and 15.8 / 10.5 / 10.4 s (`1-1.1.1`); 29 cdc-acm reads ended with `-104` ("urb shutting down") during a 35 s idle on `1-1.1.1` (the console still answered, as the timed-out read itself is resubmitted, so one read survives); the libusb read got `-110` after 5.2 s and cdc-acm's re-probe took over 15 s.
+
+### Results
+
+Measured on the S31 bench from the WSL2 client (`regression.sh open idle timeout`, the esptool catch script, a heap probe through MCP `get_bridge_info`):
+
+| | old image `2f12b2d` | option 1 (old code, 48 URBs, 64 slots, PSRAM stacks) | option 2 (old code, reader never blocks on IN, IN limited to 12 of 16 slots) | shipped |
+|---|---|---|---|---|
+| pyserial open, idle cdc-acm port | 9.3 to 17.9 s | 15 to 35 ms | 10 to 32 ms | 9 to 16 ms |
+| 35 s idle: cdc-acm reads given up | 29 (-104) | 30 (-104) | console silent at 25 s, answered after 3.5 s at 35 s (the -110 timeouts were not counted by the test then) | 0 |
+| libusb 20 s read on the idle endpoint | -110 at 5.2 s | -110 at 5.2 s | bridge -110 after 3.9 s; console silent after the unlink | -7 at 20.0 s, console works after the unlink |
+| esptool catch of `1-1.1.2` (60 s) | not caught, 22 re-attaches | caught in 6 s | caught after 27 s (10 re-attaches, 5 esptool rounds) | caught in 3 s, first attach |
+| heap per pending read | 8 KiB stack (internal) | 8 KiB stack (PSRAM), and the quick patch leaked (needs `vTaskDeleteWithCaps`) | 8 KiB task stack (internal RAM): 17 pending reads = 148 KiB, returned on close | about 1 KiB; 17 reads = 17 KiB, all back on detach |
+
+The `1-1.1.2` DUT (sbc-mcu-dut-controller#6) is an ESP32-S3 (QFN56, v0.1) with 4 MB embedded XMC flash and 2 MB embedded PSRAM, MAC f4:12:fa:59:5d:b0, and its flash is **erased** (bootloader and partition table all 0xFF): the ROM has nothing to boot and its watchdog resets it every 2.7 s. Not reflashed; waiting on the user.
+
+Bench notes: the Tachyon's USB-C dock put the Tachyon into device/sink mode after a PD renegotiation (host controller deregistered, `data_role: host [device]`); the UCSI data-role swap failed and a reboot of the Tachyon (authorised by the user) restored host mode. Every CDC DUT runs WipperSnapper, so there is no REPL: the quiet Feather at `1-1.1.1` answers Ctrl-C/Enter with its fatal-error line and serves as the idle console. During the first full regression both hubs re-enumerated twice within 7 s right after the QT Py mass-storage test (every device got a new address); it did not recur in the later runs or on the old-code images, so it looks like a power event on the bus-powered GL850G chain when the QT Py rebooted after its filesystem changed, not a bridge regression. Worth watching.

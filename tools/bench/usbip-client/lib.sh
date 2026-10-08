@@ -45,11 +45,18 @@ attach() {
   awk 'NR>1 && $3!="004"{print $7}' $VHCI/status | tail -1
 }
 
-# tty_of <local busid> [ttyACM|ttyUSB]
+# tty_of <local busid> [ttyACM|ttyUSB] [seconds]: waits up to <seconds> (15)
+# for the driver to bind (its probe does control transfers, which took 10 s
+# each on a bridge that let pending reads delay them).
 tty_of() {
-  local kind="${2:-ttyACM}"
-  ls -d /sys/bus/usb/devices/"$1":*/tty/"$kind"* /sys/bus/usb/devices/"$1":*/"$kind"* 2>/dev/null \
-    | head -1 | xargs -r basename
+  local kind="${2:-ttyACM}" n
+  for n in $(seq 1 "${3:-15}"); do
+    local t; t=$(ls -d /sys/bus/usb/devices/"$1":*/tty/"$kind"* /sys/bus/usb/devices/"$1":*/"$kind"* 2>/dev/null \
+      | head -1 | xargs -r basename)
+    [ -n "$t" ] && [ -e "/dev/$t" ] && { echo "$t"; return 0; }
+    sleep 1
+  done
+  return 1
 }
 
 # usb_vfat_dev: the first vfat filesystem on a USB block device
@@ -65,3 +72,44 @@ usb_vfat_dev() {
 
 # 1200-baud touch on a CDC ACM tty (RP2040/CircuitPython -> BOOTSEL)
 touch_1200() { python3 -c "import serial,time; s=serial.Serial('/dev/$1',1200); time.sleep(0.3); s.close()"; }
+
+# serial_open_times <tty> [n]: open the port n times, print each open time in
+# seconds, one per line (an idle cdc-acm port used to take 9-18 s per open).
+serial_open_times() {
+  python3 - "/dev/$1" "${2:-3}" <<'PY'
+import serial, sys, time
+for _ in range(int(sys.argv[2])):
+    t = time.time(); s = serial.Serial(sys.argv[1], 115200, timeout=1); dt = time.time() - t
+    s.close(); print("%.3f" % dt); time.sleep(0.3)
+PY
+}
+
+# console_probe <tty> <idle secs>: open a CDC console, leave it idle with
+# cdc-acm's reads pending for <idle secs>, then send Ctrl-C and Enter and wait
+# for any answer (a CircuitPython REPL prompt, or WipperSnapper's status/error
+# line). Prints "ANSWERED <bytes> in <secs> s" or "SILENT <bytes> <repr>".
+console_probe() {
+  python3 - "/dev/$1" "$2" <<'PY'
+import serial, sys, time
+s = serial.Serial(sys.argv[1], 115200, timeout=0.2)
+time.sleep(float(sys.argv[2]))
+s.reset_input_buffer()
+s.write(b"\x03"); time.sleep(0.5); s.write(b"\r\n")
+t = time.time(); got = b""
+while time.time() - t < 4:
+    got += s.read(512)
+    if len(got) >= 8 or b">>>" in got:
+        print("ANSWERED %d in %.2f s" % (len(got), time.time() - t)); break
+else:
+    print("SILENT %d %r" % (len(got), got[-60:]))
+s.close()
+PY
+}
+
+# cdc-acm logs each failed read URB when its dynamic debug is on:
+#   "urb shutting down with status: -104"   ECONNRESET: cdc-acm stops resubmitting that read
+#   "nonzero urb status received: -110"      ETIMEDOUT: resubmitted
+# acm_read_errors_since <tag> counts both since the mark, excluding the -2
+# (ENOENT) lines of a normal close.
+acm_debug_on() { echo 'func acm_read_bulk_callback +p' > /sys/kernel/debug/dynamic_debug/control 2>/dev/null; }
+acm_read_errors_since() { dmesg_since "$1" | grep -c 'acm_read_bulk_callback.*: -1[0-9][0-9]'; }

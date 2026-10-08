@@ -72,30 +72,44 @@ typedef struct {
 esp_err_t usb_backend_start(void);
 size_t usb_backend_get_devices(usbip_backend_device_t *out_devices, size_t max_devices);
 bool usb_backend_get_device_by_busid(const char busid[32], usbip_backend_device_t *out_device);
-int usb_backend_control_transfer(const char busid[32],
-                                 const usb_setup_packet_t *setup,
-                                 const uint8_t *out_data,
-                                 size_t out_len,
-                                 uint8_t *in_data,
-                                 size_t in_capacity,
-                                 size_t *in_len,
-                                 volatile bool *cancel);
-int usb_backend_bulk_transfer(const char busid[32],
-                              uint8_t endpoint_addr,
-                              const uint8_t *out_data,
-                              size_t out_len,
-                              uint8_t *in_data,
-                              size_t in_capacity,
-                              size_t *in_len,
-                              volatile bool *cancel);
-int usb_backend_interrupt_transfer(const char busid[32],
-                                   uint8_t endpoint_addr,
-                                   const uint8_t *out_data,
-                                   size_t out_len,
-                                   uint8_t *in_data,
-                                   size_t in_capacity,
-                                   size_t *in_len,
-                                   volatile bool *cancel);
+
+/* An asynchronous transfer request.  The caller fills the public fields and
+   submits it; the backend task calls done() exactly once, when the transfer
+   has completed, failed, or been cancelled.  The request and its buffers
+   must stay valid until then.  No task waits on a transfer, so a request the
+   device does not answer (a pending read) costs only this struct and its
+   buffer, like a pending URB on a Linux host. */
+typedef struct usb_backend_req usb_backend_req_t;
+typedef void (*usb_backend_done_cb_t)(usb_backend_req_t *req, int status, size_t in_len);
+
+struct usb_backend_req {
+    /* Filled by the caller */
+    char busid[32];
+    uint8_t endpoint_addr;          /* 0 = control (setup is used), 0x8N IN, 0x0N OUT */
+    usb_setup_packet_t setup;
+    const uint8_t *out_data;
+    size_t out_len;
+    uint8_t *in_data;
+    size_t in_capacity;
+    usb_backend_done_cb_t done;     /* called from the backend task: status is 0 or a negative errno */
+    void *ctx;                      /* for the caller */
+
+    /* Owned by the backend from usb_backend_submit() until done() */
+    volatile bool cancel;           /* set by usb_backend_cancel() */
+    struct usb_backend_req *next;
+    uint32_t seq;
+    int status;
+};
+
+/* Queue a transfer.  Never blocks; done() follows from the backend task,
+   also for immediate failures (-ENODEV, -ENOMEM, ...). */
+void usb_backend_submit(usb_backend_req_t *req);
+
+/* Retire a queued or in-flight request: done() is called with -ECONNRESET,
+   or with the real result if the transfer completed first.  Safe to call
+   more than once, and after done(). */
+void usb_backend_cancel(usb_backend_req_t *req);
+
 bool usb_backend_is_interrupt_endpoint(const char busid[32], uint8_t ep_num, uint8_t direction);
 
 /* The client's USB/IP session for a device has ended: release its claimed
