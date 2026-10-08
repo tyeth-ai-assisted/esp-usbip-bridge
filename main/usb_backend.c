@@ -35,6 +35,15 @@
 
 #define USB_BACKEND_NUM_PIPES CONFIG_USBIP_NUM_PIPES
 
+/* Software deadline for a transfer (the host library ignores timeout_ms). */
+#define USB_BACKEND_XFER_TIMEOUT_MS 5000
+/* How long a cancelled control transfer may take to come back before its
+   slot is orphaned instead (it normally takes a few ms). */
+#define USB_BACKEND_CANCEL_WAIT_MS 1000
+/* Control transfers retired by another transfer's EP0 flush are submitted
+   again, at most this many times. */
+#define USB_BACKEND_MAX_CTRL_RESUBMITS 3
+
 #ifndef USB_CLASS_HUB
 #define USB_CLASS_HUB 0x09
 #endif
@@ -69,6 +78,9 @@ typedef struct {
     volatile bool submitted;        /* true = transfer handed to DWC hw */
     volatile bool completed;        /* true = DWC callback has fired */
     volatile bool aborted;          /* true = we forced abort (timeout/cancel) */
+    bool cancel_sent;               /* usb_host_transfer_cancel_control() called */
+    TickType_t cancel_tick;         /* when it was called */
+    uint8_t resubmits;              /* resubmissions after a collateral EP0 flush */
     bool orphaned;                  /* caller answered, transfer still in flight (state_mutex) */
     bool caller_left;               /* caller returned while orphaned (state_mutex) */
 
@@ -87,7 +99,7 @@ typedef struct {
     /* In-flight transfer tracking (for non-blocking operation) */
     usb_transfer_t *xfer;           /* allocated transfer, NULL when idle */
     usb_device_handle_t dev_hdl;    /* cached device handle for abort */
-    TickType_t deadline;            /* when the software timeout expires */
+    TickType_t deadline;            /* when the software timeout expires (set when queued) */
     bool is_control;                /* true = EP0 control transfer */
     bool is_in;                     /* true = device-to-host */
     size_t payload_len;             /* requested data length */
@@ -944,7 +956,7 @@ static int prepare_and_submit_transfer(usb_backend_pipe_req_t *pipe)
     transfer->device_handle = pipe->dev_hdl;
     transfer->bEndpointAddress = pipe->endpoint_addr;
     transfer->num_bytes = xfer_len;
-    transfer->timeout_ms = 5000;
+    transfer->timeout_ms = USB_BACKEND_XFER_TIMEOUT_MS;
 
     if (pipe->is_control) {
         err = usb_host_transfer_submit_control(s_state.client_hdl, transfer);
@@ -959,15 +971,18 @@ static int prepare_and_submit_transfer(usb_backend_pipe_req_t *pipe)
             return -EIO;
         }
         /* A data pipe refuses URBs while it is halted (Linux answers
-           -EPIPE); the default pipe only does when the device is gone. */
-        return pipe->is_control ? -ENODEV : -EPIPE;
+           -EPIPE).  The default pipe refuses them while the host library
+           recovers it (after a STALL, an error or a cancel it stays halted
+           until usbh_process() clears it) and once the device is gone; the
+           device slot was found above, so retry until the deadline. */
+        return pipe->is_control ? -EAGAIN : -EPIPE;
     }
 
     pipe->xfer = transfer;
     pipe->submitted = true;
     pipe->completed = false;
     pipe->aborted = false;
-    pipe->deadline = xTaskGetTickCount() + pdMS_TO_TICKS(transfer->timeout_ms);
+    pipe->cancel_sent = false;
     return 0;
 }
 
@@ -1138,6 +1153,16 @@ static void usb_backend_task(void *arg)
             }
 
             int ret = prepare_and_submit_transfer(pipe);
+            if (ret == -EAGAIN) {
+                /* EP0 is being recovered: try again on the next pass. */
+                if (pipe->cancel != NULL && *pipe->cancel) {
+                    ret = -ECONNRESET;
+                } else if (now >= pipe->deadline) {
+                    ret = -ETIMEDOUT;
+                } else {
+                    continue;
+                }
+            }
             if (ret < 0) {
                 /* Immediate failure (bad device, no memory, etc.) —
                    complete the request now. */
@@ -1190,13 +1215,61 @@ static void usb_backend_task(void *arg)
                 usb_host_endpoint_clear(pipe->dev_hdl, pipe->endpoint_addr);
             }
 
-            /* The host library cannot cancel a control transfer, and an
-               aborted transfer may still be in flight after the halt/flush
-               above.  Freeing it then lets the stack write into freed heap,
-               so answer the caller now and hold the slot until the transfer
-               really completes (the device answers, or is gone). */
+            /* Cancel an aborted control transfer: the host library retires
+               it (and, if it was on the bus, every control transfer queued
+               to the device; see the resubmission below) and calls back
+               with USB_TRANSFER_STATUS_CANCELED.  Without this, a transfer
+               the device never finishes blocks the device's EP0 for good:
+               every later control transfer queues behind it.  Wait for the
+               callback on later passes. */
+            if (pipe->aborted && !pipe->completed && pipe->is_control
+                && pipe->dev_hdl != NULL) {
+                if (!pipe->cancel_sent) {
+                    pipe->cancel_sent = true;
+                    pipe->cancel_tick = now;
+                    esp_err_t cerr = usb_host_transfer_cancel_control(s_state.client_hdl, pipe->xfer);
+                    if (cerr != ESP_OK && cerr != ESP_ERR_INVALID_STATE) {
+                        ESP_LOGW(TAG, "%s: control cancel failed: %s", pipe->busid, esp_err_to_name(cerr));
+                        pipe->cancel_tick = now - pdMS_TO_TICKS(USB_BACKEND_CANCEL_WAIT_MS);
+                    } else {
+                        ESP_LOGI(TAG, "%s: control transfer %s, cancelled (bmRequestType 0x%02x bRequest 0x%02x wValue 0x%04x wIndex 0x%04x)",
+                                 pipe->busid,
+                                 (pipe->cancel != NULL && *pipe->cancel) ? "unlinked" : "timed out",
+                                 pipe->setup.bmRequestType, pipe->setup.bRequest,
+                                 pipe->setup.wValue, pipe->setup.wIndex);
+                    }
+                }
+                if ((now - pipe->cancel_tick) < pdMS_TO_TICKS(USB_BACKEND_CANCEL_WAIT_MS)) {
+                    continue;
+                }
+                ESP_LOGW(TAG, "%s: cancelled control transfer did not complete, holding its slot",
+                         pipe->busid);
+            }
+
+            /* An aborted transfer may still be in flight after the halt/flush
+               or cancel above.  Freeing it then lets the stack write into
+               freed heap, so answer the caller now and hold the slot until
+               the transfer really completes (the device answers, or is
+               gone). */
             if (pipe->aborted && !pipe->completed) {
                 orphan_transfer(pipe);
+                continue;
+            }
+
+            /* A control transfer retired by an EP0 flush it did not ask for
+               (another transfer's cancel, or an EP0 error on another
+               transfer) never ran to completion: submit it again, as Linux
+               keeps URBs queued behind an unlinked or failed one. */
+            if (pipe->completed && !pipe->aborted && pipe->is_control
+                && pipe->xfer->status == USB_TRANSFER_STATUS_CANCELED
+                && pipe->resubmits < USB_BACKEND_MAX_CTRL_RESUBMITS) {
+                pipe->resubmits++;
+                ESP_LOGD(TAG, "%s: control transfer retired by an EP0 flush, resubmitting (%u)",
+                         pipe->busid, pipe->resubmits);
+                usb_host_transfer_free(pipe->xfer);
+                pipe->xfer = NULL;
+                pipe->completed = false;
+                pipe->submitted = false;   /* Phase 1 submits it again */
                 continue;
             }
 
@@ -1208,8 +1281,9 @@ static void usb_backend_task(void *arg)
                 int status = complete_transfer(pipe);
 
                 /* If we forced the abort, override the hardware status
-                   with the appropriate errno. */
-                if (pipe->aborted) {
+                   with the appropriate errno, unless the transfer finished
+                   on its own before the abort took effect. */
+                if (pipe->aborted && (!pipe->completed || usb_status == USB_TRANSFER_STATUS_CANCELED)) {
                     status = (pipe->cancel != NULL && *pipe->cancel)
                                  ? -ECONNRESET
                                  : -ETIMEDOUT;
@@ -1502,6 +1576,9 @@ static int submit_pipe_request(const char busid[32],
     pipe->in_len_out = in_len;
     pipe->status_out = &status;
     pipe->cancel = cancel;
+    pipe->resubmits = 0;
+    pipe->cancel_sent = false;
+    pipe->deadline = xTaskGetTickCount() + pdMS_TO_TICKS(USB_BACKEND_XFER_TIMEOUT_MS);
 
     /* Mark active and wake the backend task. */
     pipe->active = true;
