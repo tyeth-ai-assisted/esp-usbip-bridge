@@ -242,3 +242,21 @@ Bench notes:
 - The Tachyon renegotiates USB-PD (5 V/9 V) when its 5G link dips. Its whole USB hub drops (CP2102N, S31 USB-JTAG, USB LAN), so SSH over Tailscale (100.101.245.66) is the most reliable route.
 - Flash at 460800, refuse to flash while anything holds the port, and check for "Hash of data verified". A wedged CP2102N (`can't set config #1, error -32`) needs a physical replug.
 - Some CircuitPython/WipperSnapper drives have no `CIRCUITPY` label (`WIPPER`, or none). Find them by transport and filesystem type, not by label.
+
+## 11. 2026-10-08: PSRAM, EP0 cancel, bench tools
+
+- **PSRAM** (`15ec74c`):
+  - The board's ESP32-S31-WROOM-3 (ESP32-S31NRV16) has 16 MB of in-package 1.8 V octal PSRAM (AP Memory gen 4). The datasheet v0.7 (Table 6-11) rates it at ≥ 200 MHz, so it runs at 200 MHz and passes the boot memory test.
+  - With PSRAM on, the MPLL runs at 400 MHz, which can't give RGMII its 125 MHz, so the RGMII TX clock now comes from the APLL. Free heap went from ~270 KiB to ~17 MiB.
+  - The eFuses (BLOCK1) are blank on this engineering sample (MAC 00:..), so they can't report PSRAM.
+- **Full config committed** as `sdkconfig.s31-function-coreboard-1.example`. `build-board.sh` and `idf-s31.ps1` refresh it after each build.
+- **EP0 cancel** (`b29ed79`, esp-usb `fc036c8`, bridge #21): a control transfer the device never finishes is cancelled instead of orphaned, so it no longer blocks the device's EP0 or the pipe pool.
+- **Bench tools** in `tools/bench/`:
+  - `tachyon-flash.sh` and `tachyon-console.sh`;
+  - `usbip-client/regression.sh` (BOOTSEL/picotool/UF2, esptool, mass storage, -110 timeout);
+  - `usbip-client/esp-usbjtag-catch.sh`.
+  Session scratch directories got wiped, so keep scripts here.
+- **Open:**
+  - bridge #19: idle IN reads hold slots, and the 8-in-flight cap lets them starve OUT and control. This is what stops esptool syncing with the `1-1.1.2` DUT in its ROM loader. Needs a decision.
+  - sbc-mcu-dut-controller#6: DUT not identified yet.
+  - The QT Py at `1-1.2` (WipperSnapper) reboots itself every few minutes. That's normal for it, and it occasionally makes the mass-storage test flaky.
