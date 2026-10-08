@@ -87,6 +87,11 @@ t_msc() {
 t_timeout() {
   # The RP2040's CircuitPython CDC data endpoint NAKs while nothing is printed.
   cleanup_vhci; sleep 6
+  if [ "$(bridge_dev "$RP2040_BUSID")" = "2e8a:0003" ]; then
+    # Left in BOOTSEL by an earlier test: back to the application
+    attach "$RP2040_BUSID" >/dev/null; sleep 5
+    timeout 30 picotool reboot >/dev/null 2>&1; sleep 2; cleanup_vhci
+  fi
   wait_bridge_dev "$RP2040_BUSID" 2e8a:f00a 20 || { fail "timeout: $RP2040_BUSID is not running its application"; return; }
   attach "$RP2040_BUSID" >/dev/null; sleep 3
   local ifep; ifep=$(lsusb -v -d 2e8a:f00a 2>/dev/null | awk '/bInterfaceNumber/{i=$2} /bInterfaceClass/{c=$2} /bEndpointAddress/ && /IN/ && c==10 {print i, $2; exit}')
