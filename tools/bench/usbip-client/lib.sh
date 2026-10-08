@@ -79,7 +79,7 @@ serial_open_times() {
   python3 - "/dev/$1" "${2:-3}" <<'PY'
 import serial, sys, time
 for _ in range(int(sys.argv[2])):
-    t = time.time(); s = serial.Serial(sys.argv[1], 115200, timeout=1); dt = time.time() - t
+    t = time.monotonic(); s = serial.Serial(sys.argv[1], 115200, timeout=1); dt = time.monotonic() - t
     s.close(); print("%.3f" % dt); time.sleep(0.3)
 PY
 }
@@ -95,11 +95,11 @@ s = serial.Serial(sys.argv[1], 115200, timeout=0.2)
 time.sleep(float(sys.argv[2]))
 s.reset_input_buffer()
 s.write(b"\x03"); time.sleep(0.5); s.write(b"\r\n")
-t = time.time(); got = b""
-while time.time() - t < 4:
+t = time.monotonic(); got = b""
+while time.monotonic() - t < 4:
     got += s.read(512)
     if len(got) >= 8 or b">>>" in got:
-        print("ANSWERED %d in %.2f s" % (len(got), time.time() - t)); break
+        print("ANSWERED %d in %.2f s" % (len(got), time.monotonic() - t)); break
 else:
     print("SILENT %d %r" % (len(got), got[-60:]))
 s.close()
