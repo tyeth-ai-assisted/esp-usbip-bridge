@@ -83,3 +83,9 @@ idf.py "${IDF_GLOBAL_ARGS[@]+"${IDF_GLOBAL_ARGS[@]}"}" \
     -DSDKCONFIG="${SDKCONFIG_FILE}" \
     -DSDKCONFIG_DEFAULTS="${DEFAULTS}" \
     "${ACTION}"
+
+# Boards with a committed full config (sdkconfig.<board>.example) get it
+# refreshed, so a change in the resolved config shows up in `git diff`.
+if [[ -f "${SDKCONFIG_FILE}.example" && -f "${SDKCONFIG_FILE}" ]]; then
+    cp "${SDKCONFIG_FILE}" "${SDKCONFIG_FILE}.example"
+fi

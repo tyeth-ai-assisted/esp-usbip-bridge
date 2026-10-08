@@ -10,4 +10,9 @@ $argsList += @("-DIDF_TARGET=esp32s31", "-DSDKCONFIG=sdkconfig.s31-function-core
                "-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.s31-function-coreboard-1")
 $argsList += $Action.Split(" ")
 idf.py @argsList
-exit $LASTEXITCODE
+$rc = $LASTEXITCODE
+# Keep the committed full config in step (see scripts/build-board.sh)
+if ($rc -eq 0 -and (Test-Path "sdkconfig.s31-function-coreboard-1")) {
+    Copy-Item "sdkconfig.s31-function-coreboard-1" "sdkconfig.s31-function-coreboard-1.example" -Force
+}
+exit $rc

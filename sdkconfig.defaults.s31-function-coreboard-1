@@ -43,3 +43,17 @@ CONFIG_USBIP_ETH_RGMII_RXD3_GPIO=16
 
 # WS2812 via a non-inverting BSS138 level shifter
 CONFIG_USBIP_NEOPIXEL_GPIO=60
+
+# In-package 1.8 V octal PSRAM (ESP32-S31-WROOM-3 on this board: ESP32-S31NRV16,
+# 16 MB, AP Memory gen 4). The module datasheet (v0.7, Table 6-11) rates its
+# maximum clock at 200 MHz or more; 250 MHz is offered by IDF but is above that.
+# IGNORE_NOTFOUND keeps a board without PSRAM bootable.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+
+# The PSRAM driver takes the MPLL (400 MHz at the PSRAM speeds above), from
+# which the RGMII TX clock cannot make 125 MHz ("EMAC out frequency cannot be
+# used", network init aborts). Clock RGMII from the APLL instead.
+CONFIG_ETH_EMAC_RGMII_TX_CLK_SRC_APLL=y

@@ -4,6 +4,8 @@ sdkconfig
 sdkconfig.*
 !sdkconfig.defaults
 !sdkconfig.defaults.*
+# Full resolved configs, committed for reference (refreshed by the build scripts)
+!sdkconfig.*.example
 sdkconfig.old
 managed_components/
 dependencies.lock
